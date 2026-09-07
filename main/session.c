@@ -1,5 +1,13 @@
 /**
- * session.c — WebSocket transport session (docs/websocket.md).
+ * session.c — session layer: public API, shared JSON dispatch, and the
+ * WebSocket transport backend (docs/websocket.md).
+ *
+ * Two transports are compiled in; the active one is chosen at connect time
+ * from what the OTA response provides:
+ *   - MQTT+UDP (docs/mqtt-udp.md) when `mqtt.endpoint` is present — this is
+ *     what api.tenclass.net actually serves (the WebSocket gateway closes
+ *     every connection); see session_mqtt.c.
+ *   - WebSocket otherwise (e.g. self-hosted servers).
  *
  * Binary protocol version 1 (raw Opus frames both ways). JSON messages are
  * dispatched by the "type" field per §4.2. Handshake: client hello with
@@ -7,6 +15,7 @@
  * server hello (transport must be "websocket"), stores session_id, and
  * (re)initializes the opus decoder at the server's announced sample rate.
  */
+#include "session_priv.h"
 #include "app.h"
 
 #include <string.h>
@@ -22,11 +31,11 @@
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
-#include "freertos/semphr.h"
 
 static const char *TAG = "session";
 static const char *PROTOCOL_VERSION = "1";
 
+/* ---- websocket backend state (shared with on_server_hello above) ---- */
 static esp_websocket_client_handle_t s_client;
 static EventGroupHandle_t s_events;
 #define EV_HELLO_OK  BIT0
@@ -36,43 +45,10 @@ static char s_session_id[64];
 static bool s_channel_open;
 static bool s_listening;          /* server-side listen state we last announced */
 
-/* reassembly for fragmented text frames */
-static char s_json_buf[4096];
-static size_t s_json_len, s_json_total;
+/* ---- shared: JSON dispatch ---- */
+static session_hello_fn_t s_hello_fn;
 
-/* ---- sending ---- */
-static void send_json_str(const char *s)
-{
-    if (!s_client) return;
-    esp_websocket_client_send_text(s_client, s, strlen(s), portMAX_DELAY);
-    ESP_LOGD(TAG, ">> %s", s);
-}
-
-static void send_json(const char *fmt, ...)
-{
-    static char buf[768];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    send_json_str(buf);
-}
-
-static const char *session_id_or_empty(void)
-{
-    return s_session_id[0] ? s_session_id : "";
-}
-
-/* ---- hello handshake ---- */
-static void send_hello(void)
-{
-    send_json("{\"type\":\"hello\",\"version\":%s,"
-              "\"features\":{\"mcp\":true},"
-              "\"transport\":\"websocket\","
-              "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,"
-              "\"channels\":1,\"frame_duration\":%d}}",
-              PROTOCOL_VERSION, CONFIG_OPUS_FRAME_DURATION_MS);
-}
+void session_set_hello_handler(session_hello_fn_t fn) { s_hello_fn = fn; }
 
 static void on_server_hello(const cJSON *json)
 {
@@ -98,8 +74,7 @@ static void on_server_hello(const cJSON *json)
     xEventGroupSetBits(s_events, EV_HELLO_OK);
 }
 
-/* ---- incoming JSON dispatch (docs/websocket.md §4.2) ---- */
-static void dispatch_json(const char *data, size_t len)
+void session_dispatch_json(const char *data, size_t len)
 {
     static char scratch[4096];
     if (len >= sizeof(scratch)) { ESP_LOGE(TAG, "json too long (%d)", (int)len); return; }
@@ -117,7 +92,7 @@ static void dispatch_json(const char *data, size_t len)
     const char *t = cJSON_GetStringValue(type);
 
     if (!strcmp(t, "hello")) {
-        on_server_hello(json);
+        if (s_hello_fn) s_hello_fn(json);
     } else if (!strcmp(t, "stt")) {
         const cJSON *text = cJSON_GetObjectItemCaseSensitive(json, "text");
         if (cJSON_IsString(text)) {
@@ -157,13 +132,57 @@ static void dispatch_json(const char *data, size_t len)
         const cJSON *msg = cJSON_GetObjectItemCaseSensitive(json, "message");
         ESP_LOGW(TAG, "alert: %.64s", cJSON_IsString(msg) ? cJSON_GetStringValue(msg) : "");
         app_post_event(APP_EVENT_ALERT, cJSON_IsString(msg) ? cJSON_GetStringValue(msg) : "alert");
+    } else if (!strcmp(t, "goodbye")) {
+        /* server-initiated teardown of the audio session */
+        ESP_LOGI(TAG, "server goodbye");
+        app_post_event(APP_EVENT_WS_CLOSED, NULL);
     } else {
         ESP_LOGD(TAG, "ignored json type: %s", t);
     }
     cJSON_Delete(json);
 }
 
-/* ---- websocket client callbacks ---- */
+/* ---- websocket backend ---- */
+
+/* reassembly for fragmented text frames */
+static char s_json_buf[4096];
+static size_t s_json_len, s_json_total;
+
+/* ---- sending ---- */
+static void send_json_str(const char *s)
+{
+    if (!s_client) return;
+    esp_websocket_client_send_text(s_client, s, strlen(s), portMAX_DELAY);
+    ESP_LOGD(TAG, ">> %s", s);
+}
+
+static void send_json(const char *fmt, ...)
+{
+    static char buf[768];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    send_json_str(buf);
+}
+
+static const char *session_id_or_empty(void)
+{
+    return s_session_id[0] ? s_session_id : "";
+}
+
+/* ---- hello handshake ---- */
+static void send_hello(void)
+{
+    send_json("{\"type\":\"hello\",\"version\":%s,"
+              "\"features\":{\"mcp\":true},"
+              "\"transport\":\"websocket\","
+              "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,"
+              "\"channels\":1,\"frame_duration\":%d}}",
+              PROTOCOL_VERSION, CONFIG_OPUS_FRAME_DURATION_MS);
+}
+
+/* ---- incoming websocket frames ---- */
 static void ws_event(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_websocket_event_data_t *d = event_data;
@@ -183,7 +202,7 @@ static void ws_event(void *handler_args, esp_event_base_t base, int32_t event_id
                 s_json_len += d->data_len;
             }
             if (s_json_len >= s_json_total && s_json_len) {
-                dispatch_json(s_json_buf, s_json_len);
+                session_dispatch_json(s_json_buf, s_json_len);
                 s_json_len = s_json_total = 0;
             }
         } else if (d->op_code == 0x2) {                           /* binary opus frame */
@@ -196,27 +215,28 @@ static void ws_event(void *handler_args, esp_event_base_t base, int32_t event_id
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "ws disconnected");
-        s_channel_open = false;
-        s_listening = false;
-        xEventGroupSetBits(s_events, EV_CLOSED);
-        app_post_event(APP_EVENT_WS_CLOSED, NULL);
+        if (s_channel_open) {
+            s_channel_open = false;
+            s_listening = false;
+            xEventGroupSetBits(s_events, EV_CLOSED);
+            app_post_event(APP_EVENT_WS_CLOSED, NULL);
+        }
         break;
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGE(TAG, "ws error");
         s_channel_open = false;
         s_listening = false;
         xEventGroupSetBits(s_events, EV_CLOSED);
-        app_post_event(APP_EVENT_WS_CLOSED, NULL);
         break;
     default:
         break;
     }
 }
 
-/* ---- public API ---- */
-bool session_is_open(void) { return s_channel_open; }
+/* ---- websocket backend API ---- */
+bool ws_is_open(void) { return s_channel_open; }
 
-int session_start(void)
+int ws_start(void)
 {
     if (s_channel_open) return 0;
     if (!g_ota_info.websocket_url[0]) { ESP_LOGE(TAG, "no websocket url"); return -1; }
@@ -224,6 +244,7 @@ int session_start(void)
     s_session_id[0] = 0;
     s_json_len = s_json_total = 0;
     xEventGroupClearBits(s_events, EV_HELLO_OK | EV_CLOSED);
+    session_set_hello_handler(on_server_hello);
 
     if (s_client) { esp_websocket_client_destroy(s_client); s_client = NULL; }
 
@@ -252,11 +273,11 @@ int session_start(void)
                                            pdMS_TO_TICKS(CONFIG_XZ_SESSION_TIMEOUT_MS));
     if (bits & EV_HELLO_OK) return 0;
     ESP_LOGE(TAG, "server hello timeout");
-    session_stop();
+    ws_stop();
     return -1;
 }
 
-void session_stop(void)
+void ws_stop(void)
 {
     s_channel_open = false;
     s_listening = false;
@@ -267,7 +288,7 @@ void session_stop(void)
     }
 }
 
-void session_start_listening(void)
+void ws_start_listening(void)
 {
     if (!s_channel_open || s_listening) return;
     send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"start\","
@@ -275,7 +296,7 @@ void session_start_listening(void)
     s_listening = true;
 }
 
-void session_stop_listening(void)
+void ws_stop_listening(void)
 {
     if (!s_channel_open || !s_listening) return;
     send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"stop\"}",
@@ -283,26 +304,82 @@ void session_stop_listening(void)
     s_listening = false;
 }
 
-void session_send_abort(void)
+void ws_send_abort(void)
 {
     if (!s_channel_open) return;
     send_json("{\"session_id\":\"%s\",\"type\":\"abort\",\"reason\":\"wake_word_detected\"}",
               session_id_or_empty());
 }
 
-void session_send_audio(const uint8_t *opus, size_t len)
+void ws_send_audio(const uint8_t *opus, size_t len)
 {
     if (!s_channel_open || !s_client) return;
     esp_websocket_client_send_bin(s_client, (const char *)opus, len, portMAX_DELAY);
 }
 
-void session_send_mcp(const char *payload_json)
+void ws_send_mcp(const char *payload_json)
 {
     send_json("{\"session_id\":\"%s\",\"type\":\"mcp\",\"payload\":%s}",
               session_id_or_empty(), payload_json);
 }
 
+/* ---- public API: backend selection ---- */
+static bool s_use_mqtt;
+
+int session_start(void)
+{
+    s_use_mqtt = g_ota_info.mqtt_endpoint[0] != 0;
+    if (s_use_mqtt) {
+        ESP_LOGI(TAG, "transport: MQTT+UDP (endpoint %s)", g_ota_info.mqtt_endpoint);
+        return mqttsess_start();
+    }
+    ESP_LOGI(TAG, "transport: WebSocket (%s)", g_ota_info.websocket_url);
+    return ws_start();
+}
+
+void session_stop(void)
+{
+    if (s_use_mqtt) mqttsess_stop();
+    else ws_stop();
+}
+
+void session_start_listening(void)
+{
+    if (s_use_mqtt) mqttsess_start_listening();
+    else ws_start_listening();
+}
+
+void session_stop_listening(void)
+{
+    if (s_use_mqtt) mqttsess_stop_listening();
+    else ws_stop_listening();
+}
+
+void session_send_abort(void)
+{
+    if (s_use_mqtt) mqttsess_send_abort();
+    else ws_send_abort();
+}
+
+void session_send_audio(const uint8_t *opus, size_t len)
+{
+    if (s_use_mqtt) mqttsess_send_audio(opus, len);
+    else ws_send_audio(opus, len);
+}
+
+void session_send_mcp(const char *payload_json)
+{
+    if (s_use_mqtt) mqttsess_send_mcp(payload_json);
+    else ws_send_mcp(payload_json);
+}
+
+bool session_is_open(void)
+{
+    return s_use_mqtt ? mqttsess_is_open() : ws_is_open();
+}
+
 void session_init(void)
 {
     s_events = xEventGroupCreate();
+    mqttsess_init();
 }

@@ -26,11 +26,12 @@ no separate programmer to buy.
 
 **Step by step**
 
-1. Download the three files from this repo's `flash/` folder — click
+1. Download the four files from this repo's `flash/` folder — click
    each file on GitHub, then the **Download raw file** button:
    - `bootloader.bin`
    - `partition-table.bin`
    - `xiaozhi_xiao_s3.bin`
+   - `srmodels.bin` (the "Computer" wake-word model)
 2. Plug the board into your computer with the USB-C cable.
 3. Open **<https://esptool.spacehuhn.com>** in Chrome or Edge.
    (The official Espressif equivalent is
@@ -43,7 +44,7 @@ no separate programmer to buy.
    *Finish*. This wipes any previous WiFi settings so the setup
    wizard starts clean. You can skip it when re-flashing a board you
    already provisioned.
-7. In the **Files** area, add each of the three files with its start
+7. In the **Files** area, add each of the four files with its start
    address — this part is critical, the addresses are not optional:
 
    | File | Start address (offset) |
@@ -51,9 +52,10 @@ no separate programmer to buy.
    | `bootloader.bin` | `0x0` |
    | `partition-table.bin` | `0x8000` |
    | `xiaozhi_xiao_s3.bin` | `0x10000` |
+   | `srmodels.bin` | `0x290000` |
 
    Click **Add file**, pick the file, and type the address from the
-   table into the box next to it. Repeat for all three.
+   table into the box next to it. Repeat for all four.
 8. Click **Program**. Flashing takes under a minute.
 9. When it says *Hard resetting…*, unplug and replug the board (or tap
    its RESET button). Go to [First boot](#first-boot) below.
@@ -131,13 +133,13 @@ idf.py -p <PORT> monitor      # watch the log; Ctrl+] to exit
   *Ports (COM & LPT)* for "USB Serial Device")
 - **Linux**: `/dev/ttyACM0` typically
 
-`idf.py flash` writes the three images to `0x0`, `0x8000` and
-`0x10000` for you — the same addresses as Route A.
+`idf.py flash` writes the four images to `0x0`, `0x8000`, `0x10000` and
+`0x290000` for you — the same addresses as Route A.
 
 > **Alternative for Windows without VS Code:** Espressif's
 > **Flash Download Tool** (GUI): <https://www.espressif.com/en/support/download/other-tools>
 > — select chip type `ESP32-S3`, *Develop* mode, *UART*, then add the
-> three files with the offsets from Route A.
+> four files with the offsets from Route A.
 
 ### Setup parameters specific to this project
 
@@ -173,8 +175,11 @@ Then open
 3. It then contacts the xiaozhi.me OTA endpoint. If the device is not
    yet bound to an xiaozhi.me account, the screen shows a 6-digit code —
    enter it at <https://xiaozhi.me> to bind.
-4. Once bound, the screen reads **Ready**. Hold the **BOOT** button to
-   talk; release to send.
+4. Once bound, the screen reads **Ready — Say "Computer"**. Say the
+   wake word **"Computer"** to start a conversation round; when the
+   answer finishes it returns to standby. The **BOOT** button also
+   works: press it in standby to talk without the wake word, or while
+   the assistant speaks to interrupt it.
 
 ---
 

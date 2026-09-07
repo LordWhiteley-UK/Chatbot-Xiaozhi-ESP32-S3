@@ -67,6 +67,7 @@ static void encoder_init(void)
     }
     opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(CONFIG_OPUS_BITRATE));
     opus_encoder_ctl(s_enc, OPUS_SET_VBR(1));
+    opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(5));   /* example default; keeps silk off the del_dec path */
     ESP_LOGI(TAG, "encoder @ %d Hz, %d bps, %d ms frames",
              IN_SAMPLE_RATE, CONFIG_OPUS_BITRATE, FRAME_MS);
 }

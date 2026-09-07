@@ -1,15 +1,17 @@
 /**
- * main.c — app entry point and device state machine (manual mode).
+ * main.c — app entry point and device state machine (wake-word standby).
  *
  * Flow: NVS -> display -> WiFi (provision if needed) -> OTA activation ->
- *       audio -> hands-free session.  There is no user button in this
- *       wiring (every spare GPIO is taken by mic/amp/OLED/USB), so the
- *       session opens automatically and the device listens continuously:
- *       while the assistant's TTS plays, the mic is muted (half-duplex),
- *       and listening resumes as soon as playback finishes.
+ *       audio -> wake word -> session.  The MQTT session stays open and
+ *       the device waits in IDLE standby for the local wake word
+ *       ("Computer", esp-sr wakenet): only then does it arm a listening
+ *       round.  While the assistant's TTS plays the mic uplink is muted
+ *       (half-duplex, no AEC), and after playback the device returns to
+ *       standby instead of listening again.  The BOOT button still works
+ *       as an optional trigger.
  *
  * State transitions follow docs/websocket.md §6.4 (manual mode):
- *   Idle -> Connecting -> Listening <-> Speaking
+ *   Idle -> Connecting -> Listening <-> Speaking -> Idle (standby)
  */
 #include "app.h"
 #include "board.h"
@@ -34,6 +36,7 @@ typedef struct {
 
 static QueueHandle_t s_events;
 static volatile app_state_t s_state = APP_STATE_STARTING;
+static bool s_wake_ok;      /* wake-word engine ready (model loaded) */
 
 static const char *state_name(app_state_t s)
 {
@@ -55,7 +58,7 @@ static void set_state(app_state_t s)
     s_state = s;
     ESP_LOGI(TAG, "state: %s", state_name(s));
     if (s == APP_STATE_IDLE)
-        display_status_line("Ready", "Connecting hands-free");
+        display_status_line("Ready", s_wake_ok ? "Say \"Computer\"" : NULL);
     else if (s != APP_STATE_WIFI_PROVISIONING && s != APP_STATE_ERROR)
         display_status_line(state_name(s), NULL);
 }
@@ -93,7 +96,27 @@ static void button_check(bool *was_pressed)
     *was_pressed = now;
 }
 
-/* ---- session lifecycle (hands-free: no button, auto reconnect) ---- */
+/* ---- session lifecycle (wake-word standby, auto reconnect) ---- */
+static void enter_standby(void)
+{
+    audio_stop_mic();              /* uplink muted; mic keeps feeding KWS */
+    audio_clear_playback();
+    if (s_wake_ok && session_is_open()) {
+        set_state(APP_STATE_IDLE); /* standby: waiting for the wake word */
+        wake_word_set_armed(true);
+    } else {
+        set_state(APP_STATE_IDLE);
+    }
+}
+
+static void start_listening_round(void)
+{
+    session_start_listening();
+    audio_start_mic();
+    wake_word_set_armed(false);
+    set_state(APP_STATE_LISTENING);
+}
+
 static void open_session(void)
 {
     set_state(APP_STATE_CONNECTING);
@@ -104,10 +127,15 @@ static void open_session(void)
         open_session();
         return;
     }
-    set_state(APP_STATE_LISTENING);
-    audio_clear_playback();
-    session_start_listening();
-    audio_start_mic();
+    if (s_wake_ok) {
+        enter_standby();
+    } else {
+        /* fallback: no wake-word model, listen continuously as before */
+        set_state(APP_STATE_LISTENING);
+        audio_clear_playback();
+        session_start_listening();
+        audio_start_mic();
+    }
 }
 
 static void close_session(void)
@@ -121,10 +149,18 @@ static void close_session(void)
 static void handle_event(app_msg_t *m)
 {
     switch (m->ev) {
+    case APP_EVENT_WAKE_WORD:
+        /* "Computer": open a listening round (or grab it back mid-speech) */
+        if (s_state == APP_STATE_IDLE && session_is_open()) {
+            audio_clear_playback();
+            start_listening_round();
+        }
+        break;
     case APP_EVENT_BTN_DOWN:
-        /* the on-board BOOT button still works as an optional mute toggle:
-           pressing it while the assistant speaks aborts the playback */
-        if (s_state == APP_STATE_SPEAKING) {
+        /* the on-board BOOT button still works as an optional trigger */
+        if (s_state == APP_STATE_IDLE && s_wake_ok && session_is_open()) {
+            start_listening_round();
+        } else if (s_state == APP_STATE_SPEAKING) {
             session_send_abort();
             audio_clear_playback();
             session_start_listening();
@@ -136,7 +172,7 @@ static void handle_event(app_msg_t *m)
         display_text(m->text);
         break;
     case APP_EVENT_TTS_START:
-        /* half-duplex: mute the mic while the assistant speaks */
+        /* half-duplex: mute the mic uplink while the assistant speaks */
         if (s_state == APP_STATE_LISTENING) {
             audio_stop_mic();
             session_stop_listening();
@@ -147,15 +183,10 @@ static void handle_event(app_msg_t *m)
         display_text(m->text);
         break;
     case APP_EVENT_TTS_STOP:
-        /* resume listening for the next utterance (session stays open) */
-        audio_clear_playback();
-        if (session_is_open()) {
-            session_start_listening();
-            audio_start_mic();
-            set_state(APP_STATE_LISTENING);
-        } else {
-            set_state(APP_STATE_IDLE);
-        }
+        /* back to standby: the next round needs the wake word again
+           (the session itself stays open) */
+        if (session_is_open()) enter_standby();
+        else set_state(APP_STATE_IDLE);
         break;
     case APP_EVENT_EMOTION:
         display_emotion(m->text);
@@ -219,9 +250,14 @@ void app_main(void)
         vTaskDelay(portMAX_DELAY);
     }
 
+    /* local "Computer" wake word: mic PCM is fed to it from the mic task */
+    s_wake_ok = wake_word_init() == 0;
+    if (s_wake_ok)
+        audio_set_pcm_cb(wake_word_feed);
+
     session_init();
     set_state(APP_STATE_IDLE);
-    open_session();          /* hands-free: connect and listen right away */
+    open_session();          /* connect; standby until the wake word */
 
     bool btn = button_pressed();
     while (true) {

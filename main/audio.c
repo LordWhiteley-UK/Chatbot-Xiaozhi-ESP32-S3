@@ -7,6 +7,10 @@
  * Mic: 16 kHz, 32-bit stereo slots (INMP441 data is 24-bit, MSB-aligned),
  * L/R pin tied to GND -> left slot; the left slot is extracted to mono.
  * Amp: same sample rate as the server's downlink (set via audio_play()).
+ *
+ * The mic task runs continuously: raw PCM frames go to the wake-word
+ * engine (if registered), and encoded frames go to the uplink callback
+ * whenever the mic is "running" (i.e. enabled for a listening round).
  */
 #include "app.h"
 #include "board.h"
@@ -35,6 +39,7 @@ static int32_t s_i2s_raw[SAMPLES_PER_FRAME * 2];   /* stereo slot buffer */
 static int16_t s_pcm_in[SAMPLES_PER_FRAME];
 
 static audio_frame_cb_t s_on_encoded;
+static audio_pcm_cb_t s_on_pcm;
 static RingbufHandle_t s_play_ring;
 static TaskHandle_t s_mic_task, s_play_task;
 static volatile bool s_mic_running;
@@ -43,6 +48,7 @@ static volatile size_t s_play_pending;
 
 void audio_start_mic(void) { s_mic_running = true; }
 void audio_stop_mic(void)  { s_mic_running = false; }
+void audio_set_pcm_cb(audio_pcm_cb_t cb) { s_on_pcm = cb; }
 bool audio_is_playing(void){ return s_play_pending > 0; }
 
 void audio_clear_playback(void)
@@ -68,22 +74,18 @@ void audio_play(const uint8_t *opus, size_t len, int sample_rate)
         s_play_pending += nsamples * 2;
 }
 
-/* ---- mic task: I2S -> PCM -> opus -> callback ---- */
+/* ---- mic task: I2S -> PCM -> [wake word] -> opus -> callback ---- */
 static void mic_task(void *arg)
 {
     size_t bytes_read;
     while (true) {
-        if (!s_mic_running) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-            i2s_channel_disable(s_rx_chan);
-            while (!s_mic_running) vTaskDelay(pdMS_TO_TICKS(50));
-            i2s_channel_enable(s_rx_chan);
-        }
         if (i2s_channel_read(s_rx_chan, s_i2s_raw, sizeof(s_i2s_raw),
                              &bytes_read, pdMS_TO_TICKS(200)) != ESP_OK) continue;
         int frames = bytes_read / (2 * sizeof(int32_t));
         for (int i = 0; i < frames; i++)
             s_pcm_in[i] = (int16_t)(s_i2s_raw[2 * i] >> 16);   /* left slot, top 16 bits */
+        if (s_on_pcm) s_on_pcm(s_pcm_in, frames);
+        if (!s_mic_running) continue;         /* uplink muted; mic still runs */
         size_t enc_len = 0;
         const uint8_t *enc = opus_encode_frame(s_pcm_in, frames, &enc_len);
         if (enc && enc_len > 0 && s_on_encoded) s_on_encoded(enc, enc_len);
@@ -159,7 +161,7 @@ int audio_init(audio_frame_cb_t on_encoded_frame)
     s_play_ring = xRingbufferCreate(PLAY_RING_SIZE, RINGBUF_TYPE_BYTEBUF);
     if (!s_play_ring) { ESP_LOGE(TAG, "play ring alloc failed"); return -1; }
 
-    if (xTaskCreate(mic_task, "mic", 8192, NULL, 10, &s_mic_task) != pdTRUE ||
+    if (xTaskCreate(mic_task, "mic", 32768, NULL, 10, &s_mic_task) != pdTRUE ||
         xTaskCreate(play_task, "play", 4096, NULL, 9, &s_play_task) != pdTRUE) {
         ESP_LOGE(TAG, "task create failed");
         return -1;

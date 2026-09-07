@@ -99,6 +99,7 @@ int ota_fetch(ota_info_t *out)
     }
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_header(client, "Device-Id", app_device_id());
+    esp_http_client_set_header(client, "Client-Id", app_client_id());
     esp_http_client_set_header(client, "Activation-Version", "1");
     esp_http_client_set_post_field(client, body, strlen(body));
 
@@ -123,6 +124,15 @@ int ota_fetch(ota_info_t *out)
                 find_field(root, "websocket.url", out->websocket_url, sizeof(out->websocket_url));
                 find_field(root, "websocket.token", out->token, sizeof(out->token));
                 find_field(root, "firmware.version", out->firmware_version, sizeof(out->firmware_version));
+                /* MQTT+UDP transport credentials (docs/mqtt-udp.md §6.1).
+                   NOTE: the server appends the OTA request's Client-Id header
+                   to mqtt.client_id, so that header must be sent (below). */
+                find_field(root, "mqtt.endpoint", out->mqtt_endpoint, sizeof(out->mqtt_endpoint));
+                find_field(root, "mqtt.client_id", out->mqtt_client_id, sizeof(out->mqtt_client_id));
+                find_field(root, "mqtt.username", out->mqtt_username, sizeof(out->mqtt_username));
+                find_field(root, "mqtt.password", out->mqtt_password, sizeof(out->mqtt_password));
+                find_field(root, "mqtt.publish_topic", out->mqtt_publish_topic, sizeof(out->mqtt_publish_topic));
+                find_field(root, "mqtt.subscribe_topic", out->mqtt_subscribe_topic, sizeof(out->mqtt_subscribe_topic));
                 /* activation code: string field "code" under "activation" */
                 char code[16] = {0}, msg[64] = {0};
                 find_field(root, "activation.code", code, sizeof(code));

@@ -30,6 +30,13 @@ typedef struct {
     char firmware_version[32];
     bool needs_activation;
     char activation_code[16];   /* shown on the OLED when not yet activated */
+    /* MQTT+UDP transport credentials (docs/mqtt-udp.md §6.1) */
+    char mqtt_endpoint[128];
+    char mqtt_client_id[160];
+    char mqtt_username[256];
+    char mqtt_password[256];
+    char mqtt_publish_topic[64];
+    char mqtt_subscribe_topic[64];
 } ota_info_t;
 
 /* Result of the OTA exchange, shared with the session layer. */
@@ -49,7 +56,9 @@ void display_emotion(const char *emotion);
 
 /* Audio */
 typedef void (*audio_frame_cb_t)(const uint8_t *opus, size_t len);
+typedef void (*audio_pcm_cb_t)(const int16_t *pcm, int nsamples);
 int audio_init(audio_frame_cb_t on_encoded_frame);
+void audio_set_pcm_cb(audio_pcm_cb_t cb);   /* e.g. the wake-word engine */
 void audio_start_mic(void);
 void audio_stop_mic(void);
 void audio_play(const uint8_t *opus, size_t len, int sample_rate);
@@ -82,6 +91,13 @@ bool session_is_open(void);
 void mcp_handle_payload(const char *payload_json, size_t len);
 void session_init(void);
 
+/* Local wake word (esp-sr wakenet, "Computer") */
+int wake_word_init(void);
+bool wake_word_ready(void);
+const char *wake_word_name(void);
+void wake_word_set_armed(bool armed);
+void wake_word_feed(const int16_t *pcm, int nsamples);
+
 /* App event queue (main.c owns it; protocol callbacks post into it) */
 typedef enum {
     APP_EVENT_BTN_DOWN = 0,
@@ -92,6 +108,7 @@ typedef enum {
     APP_EVENT_TTS_TEXT,
     APP_EVENT_EMOTION,
     APP_EVENT_ALERT,
+    APP_EVENT_WAKE_WORD,
     APP_EVENT_WS_CLOSED,
 } app_event_t;
 void app_post_event(app_event_t ev, const char *text);   /* copies text */
