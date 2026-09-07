@@ -17,6 +17,7 @@
 
 #include "esp_log.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "esp_system.h"
 #include "cJSON.h"
 #include "nvs.h"
@@ -87,6 +88,9 @@ int ota_fetch(ota_info_t *out)
         .url = CONFIG_OTA_URL,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 15000,
+        /* server verification via the built-in x509 bundle (CONFIG
+           MBEDTLS_CERTIFICATE_BUNDLE); without this https init fails */
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
@@ -102,8 +106,13 @@ int ota_fetch(ota_info_t *out)
     char *resp = malloc(8192);
     if (!resp) { esp_http_client_cleanup(client); return -1; }
     int resp_len = 0;
-    esp_err_t err = esp_http_client_perform(client);
+    /* open/write/fetch_headers/read flow — perform() discards the body,
+       so esp_http_client_read_response would return 0 bytes after it */
+    int wlen = strlen(body);
+    esp_err_t err = esp_http_client_open(client, wlen);
     if (err == ESP_OK) {
+        esp_http_client_write(client, body, wlen);
+        esp_http_client_fetch_headers(client);
         int status = esp_http_client_get_status_code(client);
         resp_len = esp_http_client_read_response(client, resp, 8191);
         resp[resp_len > 0 ? resp_len : 0] = 0;
@@ -134,6 +143,7 @@ int ota_fetch(ota_info_t *out)
         ESP_LOGE(TAG, "OTA request failed: %s", esp_err_to_name(err));
     }
     free(resp);
+    esp_http_client_close(client);
     esp_http_client_cleanup(client);
     return (out->websocket_url[0] || out->activation_code[0]) ? 0 : -1;
 }

@@ -34,11 +34,24 @@ static const char *FORM_HTML =
 "<title>XIAO voice setup</title></head>"
 "<body style='font-family:sans-serif;max-width:22em;margin:3em auto'>"
 "<h2>WiFi setup</h2>"
+"<h3>Available networks <small><a href='/'>(rescan)</a></small></h3>"
+"<div id='nets' style='display:flex;flex-direction:column;gap:.4em;margin-bottom:1em'>"
+"Scanning...</div>"
 "<form method='POST' action='/save'>"
-"<p><label>SSID<br><input name='ssid' maxlength='32' required></label></p>"
-"<p><label>Password<br><input name='pass' type='password' maxlength='64'></label></p>"
+"<p><label>SSID<br><input id='ssid' name='ssid' maxlength='32' required></label></p>"
+"<p><label>Password<br><input id='pass' name='pass' type='password' maxlength='64'></label></p>"
 "<p><button type='submit'>Save &amp; connect</button></p>"
-"</form></body></html>";
+"</form>"
+"<script>"
+"fetch('/scan').then(r=>r.json()).then(list=>{"
+"const el=document.getElementById('nets');el.textContent='';"
+"if(!list.length){el.textContent='None found - use manual entry below';return;}"
+"list.forEach(ap=>{const b=document.createElement('button');b.type='button';"
+"b.textContent=ap.ssid+' ('+ap.rssi+(ap.lock?', locked':', open')+')';"
+"b.onclick=()=>{document.getElementById('ssid').value=ap.ssid;"
+"document.getElementById('pass').focus();};el.appendChild(b);});"
+"}).catch(()=>{document.getElementById('nets').textContent='';});"
+"</script></body></html>";
 
 void app_nvs_set_wifi(const char *ssid, const char *pass)
 {
@@ -96,6 +109,55 @@ static esp_err_t form_handler(httpd_req_t *req)
     return httpd_resp_send(req, FORM_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
+/* Escape a string for embedding inside a JSON string literal. */
+static void json_escape(const char *in, char *out, size_t out_len)
+{
+    size_t o = 0;
+    for (; *in && o < out_len - 1; in++) {
+        char c = *in;
+        if (c == '"' || c == '\\') {
+            if (o >= out_len - 2) break;
+            out[o++] = '\\';
+        }
+        out[o++] = c;
+    }
+    out[o] = 0;
+}
+
+/* GET /scan — scan for APs visible to the STA interface (the radio runs
+   in APSTA mode during provisioning) and return them as a JSON array. */
+static esp_err_t scan_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+
+    static wifi_ap_record_t records[20];
+    uint16_t n = 0;
+    if (esp_wifi_scan_start(NULL, true) != ESP_OK ||
+        esp_wifi_scan_get_ap_records(&n, records) != ESP_OK) {
+        return httpd_resp_send(req, "[]", 2);
+    }
+
+    /* up to 20 SSIDs, each quoted/escaped: 32 chars -> up to 66 bytes */
+    char *buf = malloc(20 * 90 + 8);
+    if (!buf) return httpd_resp_send(req, "[]", 2);
+    size_t o = 0;
+    buf[o++] = '[';
+    for (uint16_t i = 0; i < n; i++) {
+        char esc[3 * 32 + 3];
+        json_escape((const char *)records[i].ssid, esc, sizeof(esc));
+        int w = snprintf(buf + o, 100, "%s{\"ssid\":\"%s\",\"rssi\":%d,\"lock\":%d}",
+                         o > 1 ? "," : "", esc, records[i].rssi,
+                         records[i].authmode != WIFI_AUTH_OPEN ? 1 : 0);
+        if (w < 0 || o + w >= 20 * 90 - 1) break;
+        o += w;
+    }
+    buf[o++] = ']';
+    buf[o] = 0;
+    esp_err_t r = httpd_resp_send(req, buf, (int)o);
+    free(buf);
+    return r;
+}
+
 static int urldecode(const char *in, char *out, size_t out_len)
 {
     size_t o = 0;
@@ -149,15 +211,22 @@ static void run_provisioning_ap(void)
     esp_netif_create_default_wifi_ap();
 
     wifi_config_t ap_cfg = { 0 };
+    /* AP name suffix: the MAC without separators (Xiaozhi-XXXXXXXXXXXX) */
+    char suffix[13];
+    const char *id = app_device_id();
+    for (int i = 0, j = 0; id[i] && j < 12; i++)
+        if (id[i] != ':') suffix[j++] = id[i];
+    suffix[12] = 0;
     char ap_name[32];
-    snprintf(ap_name, sizeof(ap_name), "Xiaozhi-%s", app_device_id() + 6);
+    snprintf(ap_name, sizeof(ap_name), "Xiaozhi-%s", suffix);
     strlcpy((char *)ap_cfg.ap.ssid, ap_name, sizeof(ap_cfg.ap.ssid));
     ap_cfg.ap.ssid_len = strlen(ap_name);
     ap_cfg.ap.channel = 6;
     ap_cfg.ap.max_connection = 4;
     ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    /* APSTA: keeps the provisioning AP up while the STA interface scans */
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_LOGI(TAG, "provisioning AP '%s' started", ap_name);
@@ -219,8 +288,10 @@ void wifi_prov_start(void)
     ESP_ERROR_CHECK(httpd_start(&server, &http_cfg));
     httpd_uri_t uri_form = { .uri = "/", .method = HTTP_GET, .handler = form_handler };
     httpd_uri_t uri_save = { .uri = "/save", .method = HTTP_POST, .handler = save_handler };
+    httpd_uri_t uri_scan = { .uri = "/scan", .method = HTTP_GET, .handler = scan_handler };
     httpd_register_uri_handler(server, &uri_form);
     httpd_register_uri_handler(server, &uri_save);
+    httpd_register_uri_handler(server, &uri_scan);
 
     /* park here forever; a successful /save reboots the device */
     while (true) vTaskDelay(pdMS_TO_TICKS(10000));

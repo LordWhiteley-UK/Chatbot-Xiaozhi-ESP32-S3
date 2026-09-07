@@ -26,8 +26,9 @@ static void init_identity(void)
 {
     uint8_t mac[6];
     ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac));
+    /* canonical AA:BB:CC:DD:EE:FF — the OTA endpoint rejects bare hex */
     snprintf(s_device_id, sizeof(s_device_id),
-             "%02x%02x%02x%02x%02x%02x",
+             "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     nvs_handle_t h;

@@ -18,6 +18,7 @@
 
 #include "esp_log.h"
 #include "esp_websocket_client.h"
+#include "esp_crt_bundle.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -170,8 +171,11 @@ static void ws_event(void *handler_args, esp_event_base_t base, int32_t event_id
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "ws connected");
         send_hello();
+        ESP_LOGI(TAG, "hello sent, waiting for server hello");
         break;
     case WEBSOCKET_EVENT_DATA:
+        if (d->data_len && d->op_code != 0x2)
+            ESP_LOGI(TAG, "ws rx op=%d: %.*s", d->op_code, d->data_len > 80 ? 80 : d->data_len, d->data_ptr);
         if (d->op_code == 0x1 || (!d->op_code && s_json_len)) {   /* text frame(s) */
             if (d->payload_offset == 0) { s_json_len = 0; s_json_total = d->payload_len; }
             if (d->data_len && s_json_len + d->data_len < sizeof(s_json_buf)) {
@@ -235,6 +239,8 @@ int session_start(void)
         .buffer_size = 4096,
         .reconnect_timeout_ms = INT32_MAX,   /* app decides reconnects */
         .network_timeout_ms = CONFIG_XZ_SESSION_TIMEOUT_MS,
+        /* server verification via the built-in x509 bundle, same as ota.c */
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     s_client = esp_websocket_client_init(&cfg);
     if (!s_client) return -1;

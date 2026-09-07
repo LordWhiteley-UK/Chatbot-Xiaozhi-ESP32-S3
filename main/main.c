@@ -2,12 +2,14 @@
  * main.c — app entry point and device state machine (manual mode).
  *
  * Flow: NVS -> display -> WiFi (provision if needed) -> OTA activation ->
- *       audio -> idle.  The on-board BOOT button (GPIO0) is push-to-talk:
- *       press = connect + listen, release = stop listening; TTS plays out
- *       through the amp, a second press while speaking aborts playback.
+ *       audio -> hands-free session.  There is no user button in this
+ *       wiring (every spare GPIO is taken by mic/amp/OLED/USB), so the
+ *       session opens automatically and the device listens continuously:
+ *       while the assistant's TTS plays, the mic is muted (half-duplex),
+ *       and listening resumes as soon as playback finishes.
  *
  * State transitions follow docs/websocket.md §6.4 (manual mode):
- *   Idle -> Connecting -> Listening -> Speaking -> Idle
+ *   Idle -> Connecting -> Listening <-> Speaking
  */
 #include "app.h"
 #include "board.h"
@@ -53,7 +55,7 @@ static void set_state(app_state_t s)
     s_state = s;
     ESP_LOGI(TAG, "state: %s", state_name(s));
     if (s == APP_STATE_IDLE)
-        display_status_line("Ready", "Hold BOOT to talk");
+        display_status_line("Ready", "Connecting hands-free");
     else if (s != APP_STATE_WIFI_PROVISIONING && s != APP_STATE_ERROR)
         display_status_line(state_name(s), NULL);
 }
@@ -91,13 +93,15 @@ static void button_check(bool *was_pressed)
     *was_pressed = now;
 }
 
-/* ---- session lifecycle ---- */
+/* ---- session lifecycle (hands-free: no button, auto reconnect) ---- */
 static void open_session(void)
 {
     set_state(APP_STATE_CONNECTING);
     if (session_start() != 0) {
-        display_status_line("Connect failed", "Hold BOOT to retry");
+        display_status_line("Connect failed", "Retrying in 5s");
         set_state(APP_STATE_IDLE);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        open_session();
         return;
     }
     set_state(APP_STATE_LISTENING);
@@ -118,10 +122,9 @@ static void handle_event(app_msg_t *m)
 {
     switch (m->ev) {
     case APP_EVENT_BTN_DOWN:
-        if (s_state == APP_STATE_IDLE)
-            open_session();
-        else if (s_state == APP_STATE_SPEAKING) {
-            /* barge-in: abort the current TTS and go back to listening */
+        /* the on-board BOOT button still works as an optional mute toggle:
+           pressing it while the assistant speaks aborts the playback */
+        if (s_state == APP_STATE_SPEAKING) {
             session_send_abort();
             audio_clear_playback();
             session_start_listening();
@@ -129,30 +132,30 @@ static void handle_event(app_msg_t *m)
             set_state(APP_STATE_LISTENING);
         }
         break;
-    case APP_EVENT_BTN_UP:
-        if (s_state == APP_STATE_LISTENING) {
-            audio_stop_mic();
-            session_stop_listening();
-            /* stay connected until the response finishes playing */
-            set_state(APP_STATE_SPEAKING);
-            if (!audio_is_playing() && !session_is_open()) close_session();
-        }
-        break;
     case APP_EVENT_STT:
         display_text(m->text);
         break;
     case APP_EVENT_TTS_START:
-        if (s_state == APP_STATE_LISTENING) audio_stop_mic();
+        /* half-duplex: mute the mic while the assistant speaks */
+        if (s_state == APP_STATE_LISTENING) {
+            audio_stop_mic();
+            session_stop_listening();
+        }
         set_state(APP_STATE_SPEAKING);
         break;
     case APP_EVENT_TTS_TEXT:
         display_text(m->text);
         break;
     case APP_EVENT_TTS_STOP:
-        set_state(APP_STATE_IDLE);
-        /* let the last audio drain, then close the channel */
-        vTaskDelay(pdMS_TO_TICKS(300));
-        if (s_state == APP_STATE_IDLE) close_session();
+        /* resume listening for the next utterance (session stays open) */
+        audio_clear_playback();
+        if (session_is_open()) {
+            session_start_listening();
+            audio_start_mic();
+            set_state(APP_STATE_LISTENING);
+        } else {
+            set_state(APP_STATE_IDLE);
+        }
         break;
     case APP_EVENT_EMOTION:
         display_emotion(m->text);
@@ -161,8 +164,10 @@ static void handle_event(app_msg_t *m)
         display_status_line("Alert", m->text);
         break;
     case APP_EVENT_WS_CLOSED:
-        if (s_state == APP_STATE_LISTENING || s_state == APP_STATE_SPEAKING)
-            close_session();
+        /* reconnect and keep the conversation going */
+        close_session();
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        open_session();
         break;
     default:
         break;
@@ -191,17 +196,19 @@ void app_main(void)
         }
     }
     if (g_ota_info.activation_code[0]) {
-        /* first activation: show the code until bound at xiaozhi.me */
+        /* first activation: show the code until it is bound at xiaozhi.me.
+           The server only completes the session hello for bound devices,
+           so poll OTA until the response stops carrying an activation
+           code (i.e. the device has been registered). */
         ESP_LOGI(TAG, "activation code: %s", g_ota_info.activation_code);
         display_activation(g_ota_info.activation_code);
-        /* the server will accept the session anyway once the code is entered;
-           retry OTA periodically to pick up the websocket url after binding */
-        while (!g_ota_info.websocket_url[0]) {
+        while (g_ota_info.activation_code[0]) {
             vTaskDelay(pdMS_TO_TICKS(15000));
             ota_fetch(&g_ota_info);
             if (g_ota_info.activation_code[0])
                 display_activation(g_ota_info.activation_code);
         }
+        ESP_LOGI(TAG, "device bound, resuming boot");
         set_state(APP_STATE_IDLE);
     }
 
@@ -214,6 +221,7 @@ void app_main(void)
 
     session_init();
     set_state(APP_STATE_IDLE);
+    open_session();          /* hands-free: connect and listen right away */
 
     bool btn = button_pressed();
     while (true) {
