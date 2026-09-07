@@ -20,6 +20,7 @@
 #include <stdio.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
@@ -37,6 +38,19 @@ typedef struct {
 static QueueHandle_t s_events;
 static volatile app_state_t s_state = APP_STATE_STARTING;
 static bool s_wake_ok;      /* wake-word engine ready (model loaded) */
+
+/* After a wake word the device stays in conversation (auto-relisten after
+   each reply) until this deadline passes without activity; then standby. */
+#define CONV_TIMEOUT_US (30LL * 1000000)
+static int64_t s_conv_deadline;
+static void extend_conversation(void)
+{
+    s_conv_deadline = esp_timer_get_time() + CONV_TIMEOUT_US;
+}
+static bool in_conversation(void)
+{
+    return esp_timer_get_time() < s_conv_deadline;
+}
 
 static const char *state_name(app_state_t s)
 {
@@ -109,11 +123,18 @@ static void enter_standby(void)
     }
 }
 
+/* Arming a round: mic uplink re-opens immediately (audio.c discards the
+   first 600 ms), but the server-side round trigger ("listen detect") is
+   only sent after that window — otherwise the tail of the wake word
+   itself is transcribed as the question and the round closes on it. */
+#define LISTEN_ARM_DELAY_US (1200LL * 1000)
+static int64_t s_listen_arm_at;
+
 static void start_listening_round(void)
 {
-    session_start_listening();
     audio_start_mic();
     wake_word_set_armed(false);
+    s_listen_arm_at = esp_timer_get_time() + LISTEN_ARM_DELAY_US;
     set_state(APP_STATE_LISTENING);
 }
 
@@ -153,6 +174,7 @@ static void handle_event(app_msg_t *m)
         /* "Computer": open a listening round (or grab it back mid-speech) */
         if (s_state == APP_STATE_IDLE && session_is_open()) {
             audio_clear_playback();
+            extend_conversation();
             start_listening_round();
         }
         break;
@@ -170,6 +192,7 @@ static void handle_event(app_msg_t *m)
         break;
     case APP_EVENT_STT:
         display_text(m->text);
+        extend_conversation();
         break;
     case APP_EVENT_TTS_START:
         /* half-duplex: mute the mic uplink while the assistant speaks */
@@ -177,16 +200,24 @@ static void handle_event(app_msg_t *m)
             audio_stop_mic();
             session_stop_listening();
         }
+        extend_conversation();
         set_state(APP_STATE_SPEAKING);
         break;
     case APP_EVENT_TTS_TEXT:
         display_text(m->text);
         break;
     case APP_EVENT_TTS_STOP:
-        /* back to standby: the next round needs the wake word again
-           (the session itself stays open) */
-        if (session_is_open()) enter_standby();
-        else set_state(APP_STATE_IDLE);
+        /* within the conversation window, listen straight through for the
+           follow-up; only the wake word re-arms an expired conversation */
+        if (session_is_open()) {
+            if (in_conversation()) {
+                start_listening_round();
+            } else {
+                enter_standby();
+            }
+        } else {
+            set_state(APP_STATE_IDLE);
+        }
         break;
     case APP_EVENT_EMOTION:
         display_emotion(m->text);
@@ -264,5 +295,13 @@ void app_main(void)
         if (xQueueReceive(s_events, &m, pdMS_TO_TICKS(20)))
             handle_event(&m);
         button_check(&btn);
+        if (s_listen_arm_at && esp_timer_get_time() >= s_listen_arm_at) {
+            s_listen_arm_at = 0;
+            session_start_listening();   /* round armed on post-wake audio only */
+        }
+        /* listening round that never heard anything -> back to standby */
+        if (s_state == APP_STATE_LISTENING && !s_listen_arm_at &&
+            !in_conversation() && session_is_open())
+            enter_standby();
     }
 }

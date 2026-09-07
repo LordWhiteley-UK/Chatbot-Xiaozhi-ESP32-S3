@@ -17,8 +17,9 @@
  *      nonce is a template into which payload_len (offset 2), timestamp
  *      (offset 8) and sequence (offset 12) are written before encryption;
  *      the same 16 bytes are sent in the clear as the header.
- *   4. Each conversation round is armed by a listen "detect" message; with
- *      an empty text the server transcribes the uplink audio itself.
+ *   4. Conversation rounds use manual mode ("listen start/stop"); the
+ *      "detect" state is only a wake-word notification and makes the
+ *      server run its own wake-word pipeline on the uplink.
  */
 #include "session_priv.h"
 #include "app.h"
@@ -392,17 +393,18 @@ void mqttsess_stop(void)
 void mqttsess_start_listening(void)
 {
     if (!s_open || s_listening) return;
-    /* empty detect text: the server transcribes the uplink audio itself
-       [interpretation 4] */
-    send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"detect\",\"text\":\"\"}",
+    /* manual mode round: stream mic audio, server transcribes (spec
+       websocket.md §6 — "detect" is only a wake-word notification) */
+    send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"start\",\"mode\":\"manual\"}",
               session_id_or_empty());
     s_listening = true;
 }
 
 void mqttsess_stop_listening(void)
 {
-    /* no message: mic is muted for playback; the next round re-arms with a
-       fresh "detect" */
+    if (!s_listening) return;
+    send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"stop\",\"mode\":\"manual\"}",
+              session_id_or_empty());
     s_listening = false;
 }
 

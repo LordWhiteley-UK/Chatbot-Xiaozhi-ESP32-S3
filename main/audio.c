@@ -19,6 +19,7 @@
 #include <stdlib.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -33,6 +34,11 @@ static const char *TAG = "audio";
 #define BYTES_PER_FRAME  (SAMPLES_PER_FRAME * 2)
 
 #define PLAY_RING_SIZE   (48 * 1024)
+/* After the wake word triggers a round, skip the first 1.2 s of uplink:
+   the "Computer" utterance outlives detection, and anything of it that
+   reaches the server is transcribed as the question (round closes on
+   it). Must stay in sync with LISTEN_ARM_DELAY_US in main.c. */
+#define UPLINK_WARMUP_US (1200 * 1000)
 
 static i2s_chan_handle_t s_rx_chan, s_tx_chan;
 static int32_t s_i2s_raw[SAMPLES_PER_FRAME * 2];   /* stereo slot buffer */
@@ -45,8 +51,13 @@ static TaskHandle_t s_mic_task, s_play_task;
 static volatile bool s_mic_running;
 static volatile int s_play_sample_rate = 16000;
 static volatile size_t s_play_pending;
+static int64_t s_mic_opened_at;   /* uptime us when uplink was (re)armed */
 
-void audio_start_mic(void) { s_mic_running = true; }
+void audio_start_mic(void)
+{
+    s_mic_opened_at = esp_timer_get_time();
+    s_mic_running = true;
+}
 void audio_stop_mic(void)  { s_mic_running = false; }
 void audio_set_pcm_cb(audio_pcm_cb_t cb) { s_on_pcm = cb; }
 bool audio_is_playing(void){ return s_play_pending > 0; }
@@ -86,6 +97,7 @@ static void mic_task(void *arg)
             s_pcm_in[i] = (int16_t)(s_i2s_raw[2 * i] >> 16);   /* left slot, top 16 bits */
         if (s_on_pcm) s_on_pcm(s_pcm_in, frames);
         if (!s_mic_running) continue;         /* uplink muted; mic still runs */
+        if (esp_timer_get_time() - s_mic_opened_at < UPLINK_WARMUP_US) continue;
         size_t enc_len = 0;
         const uint8_t *enc = opus_encode_frame(s_pcm_in, frames, &enc_len);
         if (enc && enc_len > 0 && s_on_encoded) s_on_encoded(enc, enc_len);

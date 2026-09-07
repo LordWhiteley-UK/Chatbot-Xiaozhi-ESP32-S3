@@ -132,10 +132,21 @@ static esp_err_t scan_handler(httpd_req_t *req)
 
     static wifi_ap_record_t records[20];
     uint16_t n = 0;
-    if (esp_wifi_scan_start(NULL, true) != ESP_OK ||
-        esp_wifi_scan_get_ap_records(&n, records) != ESP_OK) {
+    wifi_scan_config_t scan_cfg = {
+        .show_hidden = true,
+        .scan_time.active = { .min = 100, .max = 300 },
+    };
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan start failed: %s", esp_err_to_name(err));
         return httpd_resp_send(req, "[]", 2);
     }
+    err = esp_wifi_scan_get_ap_records(&n, records);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan fetch failed: %s", esp_err_to_name(err));
+        return httpd_resp_send(req, "[]", 2);
+    }
+    ESP_LOGI(TAG, "scan found %u APs", (unsigned)n);
 
     /* up to 20 SSIDs, each quoted/escaped: 32 chars -> up to 66 bytes */
     char *buf = malloc(20 * 90 + 8);
@@ -209,6 +220,9 @@ static esp_err_t save_handler(httpd_req_t *req)
 static void run_provisioning_ap(void)
 {
     esp_netif_create_default_wifi_ap();
+    /* the STA netif must exist too: esp_wifi_scan_start() runs on the STA
+       interface even in APSTA mode, and without it every /scan fails */
+    esp_netif_create_default_wifi_sta();
 
     wifi_config_t ap_cfg = { 0 };
     /* AP name suffix: the MAC without separators (Xiaozhi-XXXXXXXXXXXX) */
