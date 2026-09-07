@@ -49,10 +49,13 @@ USB, tap **RESET**, release **BOOT** (ROM bootloader mode).
    credentials appear.
 3. **Talk to it** — the MQTT session opens automatically and the device
    stands by on the OLED (`Ready — Say "Computer"`):
-   - say **"Computer"** → a listening round opens (state `Listening`),
-     your speech is transcribed server-side and answered by TTS
-   - when the answer finishes, the device returns to standby — the next
-     round needs the wake word again
+   - say **"Computer"** → ~1.2 s later (the word's tail is skipped) a
+     listening round opens (state `Listening`); speak your question
+   - the on-device VAD ends the round when you stop talking → `Thinking`
+     on the OLED → the answer is spoken (state `Speaking`)
+   - follow-ups: after each answer the device listens again directly for
+     up to 30 s of activity — only after it lapses do you need the wake
+     word again
    - press the on-board **BOOT** button while speaking = `abort`
      (barge-in) and straight back into listening; press in standby =
      start a round without the wake word
@@ -92,8 +95,12 @@ USB, tap **RESET**, release **BOOT** (ROM bootloader mode).
    api.tenclass.net): broker port 8883 when the OTA endpoint carries no
    port; the server→device topic is `devices/p2p/<mac-with-underscores>`
    when OTA's `subscribe_topic` is literally `"null"`; the 16-byte audio
-   header doubles as the AES-CTR IV; each round is armed by a `listen
-   state:"detect"` message with empty text.
+   header doubles as the AES-CTR IV. Conversation rounds use manual listen
+   mode (`listen start`/`stop` per websocket.md §6) — the earlier
+   `state:"detect"` arming made the server run its own wake-word pipeline
+   on the uplink (every round transcribed as `小智`). In manual mode the
+   server finalizes ASR only on `listen stop`, so end-of-speech is
+   detected on-device by esp-sr's WebRTC VAD (see `audio.c`).
 5. `Activation-Version: 1` request header on the OTA call is an
    interpretation; remove it if the endpoint rejects or ignores it.
 6. Downlink audio is decoded at the rate announced in the server hello

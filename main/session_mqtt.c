@@ -233,7 +233,13 @@ static void udp_rx_task(void *arg)
             ESP_LOGE(TAG, "decrypt size mismatch");
             continue;
         }
-        if (s_listening) continue;               /* half-duplex: not while we talk */
+        if (s_listening) {                     /* half-duplex: not while we talk */
+            static int s_dropped;
+            if (++s_dropped % 50 == 1)
+                ESP_LOGW(TAG, "dropping downlink audio while listening (%d frames)",
+                         s_dropped);
+            continue;
+        }
         audio_play(plain, plen, s_downlink_rate);
     }
     vTaskDelete(NULL);
@@ -395,6 +401,7 @@ void mqttsess_start_listening(void)
     if (!s_open || s_listening) return;
     /* manual mode round: stream mic audio, server transcribes (spec
        websocket.md §6 — "detect" is only a wake-word notification) */
+    ESP_LOGI(TAG, ">> listen start (manual)");
     send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"start\",\"mode\":\"manual\"}",
               session_id_or_empty());
     s_listening = true;
@@ -403,6 +410,7 @@ void mqttsess_start_listening(void)
 void mqttsess_stop_listening(void)
 {
     if (!s_listening) return;
+    ESP_LOGI(TAG, ">> listen stop");
     send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"stop\",\"mode\":\"manual\"}",
               session_id_or_empty());
     s_listening = false;
@@ -411,6 +419,7 @@ void mqttsess_stop_listening(void)
 void mqttsess_send_abort(void)
 {
     if (!s_open) return;
+    ESP_LOGI(TAG, ">> abort (wake_word_detected)");
     send_json("{\"session_id\":\"%s\",\"type\":\"abort\",\"reason\":\"wake_word_detected\"}",
               session_id_or_empty());
 }

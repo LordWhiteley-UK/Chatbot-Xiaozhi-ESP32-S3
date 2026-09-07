@@ -5,10 +5,14 @@
  *       audio -> wake word -> session.  The MQTT session stays open and
  *       the device waits in IDLE standby for the local wake word
  *       ("Computer", esp-sr wakenet): only then does it arm a listening
- *       round.  While the assistant's TTS plays the mic uplink is muted
- *       (half-duplex, no AEC), and after playback the device returns to
- *       standby instead of listening again.  The BOOT button still works
- *       as an optional trigger.
+ *       round.  Rounds use manual listen mode: 1.2 s after the wake word
+ *       (to skip the "Computer" tail) the device sends "listen start" and
+ *       then opens the mic uplink; when the on-device VAD detects the end
+ *       of the utterance it sends "listen stop" (in manual mode the server
+ *       finalizes ASR only on stop — without it the round deadlocks and no
+ *       TTS ever returns).  While the assistant's TTS plays the mic uplink
+ *       is muted (half-duplex, no AEC).  The BOOT button still works as an
+ *       optional trigger / barge-in.
  *
  * State transitions follow docs/websocket.md §6.4 (manual mode):
  *   Idle -> Connecting -> Listening <-> Speaking -> Idle (standby)
@@ -91,6 +95,12 @@ static void on_encoded_frame(const uint8_t *opus, size_t len)
         session_send_audio(opus, len);
 }
 
+/* audio.c's VAD fired (mic task context): end of the user's utterance */
+static void on_utter_end(void)
+{
+    app_post_event(APP_EVENT_UTTER_END, NULL);
+}
+
 /* ---- BOOT button polling (debounced) ---- */
 static bool button_pressed(void)
 {
@@ -111,10 +121,27 @@ static void button_check(bool *was_pressed)
 }
 
 /* ---- session lifecycle (wake-word standby, auto reconnect) ---- */
+
+/* Arming a round: the wake-word utterance ("Computer") outlives detection
+   by a few hundred ms, so the round is held for LISTEN_ARM_DELAY_US first
+   — only then is "listen start" sent and the mic uplink opened, in that
+   order (spec §6.2: SendStartListening, then mic streaming begins). */
+#define LISTEN_ARM_DELAY_US (1200LL * 1000)
+static int64_t s_listen_arm_at;
+
+/* After a "listen stop" (VAD end-of-speech) the server normally answers
+   with STT+TTS within seconds; if nothing comes back, re-open the round
+   (inside the conversation window) instead of hanging forever. */
+#define REPLY_TIMEOUT_US (15LL * 1000000)
+static int64_t s_reply_deadline;
+
 static void enter_standby(void)
 {
     audio_stop_mic();              /* uplink muted; mic keeps feeding KWS */
     audio_clear_playback();
+    session_stop_listening();      /* close any dangling round cleanly */
+    s_listen_arm_at = 0;
+    s_reply_deadline = 0;
     if (s_wake_ok && session_is_open()) {
         set_state(APP_STATE_IDLE); /* standby: waiting for the wake word */
         wake_word_set_armed(true);
@@ -123,17 +150,10 @@ static void enter_standby(void)
     }
 }
 
-/* Arming a round: mic uplink re-opens immediately (audio.c discards the
-   first 600 ms), but the server-side round trigger ("listen detect") is
-   only sent after that window — otherwise the tail of the wake word
-   itself is transcribed as the question and the round closes on it. */
-#define LISTEN_ARM_DELAY_US (1200LL * 1000)
-static int64_t s_listen_arm_at;
-
 static void start_listening_round(void)
 {
-    audio_start_mic();
     wake_word_set_armed(false);
+    s_reply_deadline = 0;
     s_listen_arm_at = esp_timer_get_time() + LISTEN_ARM_DELAY_US;
     set_state(APP_STATE_LISTENING);
 }
@@ -200,8 +220,21 @@ static void handle_event(app_msg_t *m)
             audio_stop_mic();
             session_stop_listening();
         }
+        s_reply_deadline = 0;
         extend_conversation();
         set_state(APP_STATE_SPEAKING);
+        break;
+    case APP_EVENT_UTTER_END:
+        /* device VAD: the user finished speaking.  Manual mode: the server
+           finalizes ASR only on "listen stop" — send it, mute the uplink,
+           and wait for the reply (watchdog in the main loop re-listens if
+           nothing comes back). */
+        if (s_state == APP_STATE_LISTENING) {
+            session_stop_listening();
+            audio_stop_mic();
+            s_reply_deadline = esp_timer_get_time() + REPLY_TIMEOUT_US;
+            display_status_line("Thinking", NULL);
+        }
         break;
     case APP_EVENT_TTS_TEXT:
         display_text(m->text);
@@ -285,6 +318,7 @@ void app_main(void)
     s_wake_ok = wake_word_init() == 0;
     if (s_wake_ok)
         audio_set_pcm_cb(wake_word_feed);
+    audio_set_utter_end_cb(on_utter_end);   /* VAD end-of-speech -> listen stop */
 
     session_init();
     set_state(APP_STATE_IDLE);
@@ -297,11 +331,27 @@ void app_main(void)
         button_check(&btn);
         if (s_listen_arm_at && esp_timer_get_time() >= s_listen_arm_at) {
             s_listen_arm_at = 0;
-            session_start_listening();   /* round armed on post-wake audio only */
+            /* spec order: send "listen start" first, then open the uplink
+               (audio.c warmup keeps the JSON publish ahead of the audio) */
+            session_start_listening();
+            audio_start_mic();
+        }
+        /* reply watchdog: round ended (listen stop sent) but nothing came back */
+        if (s_reply_deadline && esp_timer_get_time() >= s_reply_deadline) {
+            s_reply_deadline = 0;
+            if (s_state == APP_STATE_LISTENING && session_is_open()) {
+                ESP_LOGI(TAG, "no server reply in %d s; %s",
+                         (int)(REPLY_TIMEOUT_US / 1000000),
+                         in_conversation() ? "re-listening" : "back to standby");
+                if (in_conversation())
+                    start_listening_round();
+                else
+                    enter_standby();
+            }
         }
         /* listening round that never heard anything -> back to standby */
         if (s_state == APP_STATE_LISTENING && !s_listen_arm_at &&
-            !in_conversation() && session_is_open())
+            !s_reply_deadline && !in_conversation() && session_is_open())
             enter_standby();
     }
 }

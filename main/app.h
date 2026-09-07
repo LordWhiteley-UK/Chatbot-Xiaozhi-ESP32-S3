@@ -57,8 +57,10 @@ void display_emotion(const char *emotion);
 /* Audio */
 typedef void (*audio_frame_cb_t)(const uint8_t *opus, size_t len);
 typedef void (*audio_pcm_cb_t)(const int16_t *pcm, int nsamples);
+typedef void (*audio_utter_end_cb_t)(void);
 int audio_init(audio_frame_cb_t on_encoded_frame);
-void audio_set_pcm_cb(audio_pcm_cb_t cb);   /* e.g. the wake-word engine */
+void audio_set_pcm_cb(audio_pcm_cb_t cb);        /* e.g. the wake-word engine */
+void audio_set_utter_end_cb(audio_utter_end_cb_t cb);   /* end-of-speech (VAD) */
 void audio_start_mic(void);
 void audio_stop_mic(void);
 void audio_play(const uint8_t *opus, size_t len, int sample_rate);
@@ -109,6 +111,7 @@ typedef enum {
     APP_EVENT_EMOTION,
     APP_EVENT_ALERT,
     APP_EVENT_WAKE_WORD,
+    APP_EVENT_UTTER_END,   /* device VAD: the user finished speaking */
     APP_EVENT_WS_CLOSED,
 } app_event_t;
 void app_post_event(app_event_t ev, const char *text);   /* copies text */
