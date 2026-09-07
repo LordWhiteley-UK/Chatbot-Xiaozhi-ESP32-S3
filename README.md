@@ -14,6 +14,9 @@ the reference implementation's source.
 
 ## Build & flash
 
+**No toolchain?** See [FLASHING.md](FLASHING.md) — flash the prebuilt
+binaries (`flash/`) from a browser using the online esptool web flasher.
+
 ```bash
 . ~/esp/esp-idf-v6.0.2/export.sh      # once per terminal session
 cd ~/xiaozhi-xiao-s3
