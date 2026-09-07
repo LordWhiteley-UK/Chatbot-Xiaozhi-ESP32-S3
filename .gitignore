@@ -1,0 +1,12 @@
+# ESP-IDF build output
+build/
+
+# Downloaded managed components (restored from idf_component.yml / dependencies.lock)
+managed_components/
+
+# Local cache
+.cache/
+
+# Full generated config (sdkconfig.defaults captures the project's choices)
+sdkconfig
+sdkconfig.old

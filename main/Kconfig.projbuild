@@ -1,0 +1,42 @@
+menu "Xiaozhi Voice Client"
+
+    config OTA_URL
+        string "OTA activation endpoint URL"
+        default "https://api.tenclass.net/xiaozhi/ota/"
+        help
+            HTTP(S) endpoint queried at boot with the device identity.
+            The response supplies the WebSocket endpoint (and, on first
+            activation, a short numeric activation code).
+
+    config OPUS_FRAME_DURATION_MS
+        int "Opus frame duration (ms)"
+        range 20 120
+        default 60
+
+    config OPUS_BITRATE
+        int "Opus uplink bitrate (bps)"
+        range 6000 510000
+        default 24000
+        help
+            Not specified by the protocol docs; 24 kbps mono at 16 kHz
+            gives good voice quality at modest uplink rate.
+
+    config XZ_SESSION_TIMEOUT_MS
+        int "Server hello timeout (ms)"
+        default 10000
+
+    config DISPLAY_FLIP_X
+        bool "Flip display horizontally"
+        default y
+        help
+            This unit's SSD1309 is mounted rotated 180 degrees from the
+            default scan direction, so both axes need flipping.
+
+    config DISPLAY_FLIP_Y
+        bool "Flip display vertically"
+        default y
+        help
+            This unit's SSD1309 is mounted rotated 180 degrees from the
+            default scan direction, so both axes need flipping.
+
+endmenu
