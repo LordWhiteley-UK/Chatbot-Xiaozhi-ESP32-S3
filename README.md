@@ -14,8 +14,9 @@ the reference implementation's source.
 
 ## Build & flash
 
-**No toolchain?** See [FLASHING.md](FLASHING.md) — flash the prebuilt
-binaries (`flash/`) from a browser using the online esptool web flasher.
+**Beginner?** See [FLASHING.md](FLASHING.md) — a hand-held walkthrough
+covering both the browser flasher (prebuilt binaries in `flash/`, no
+install) and flashing locally with VS Code or the command line.
 
 ```bash
 . ~/esp/esp-idf-v6.0.2/export.sh      # once per terminal session
