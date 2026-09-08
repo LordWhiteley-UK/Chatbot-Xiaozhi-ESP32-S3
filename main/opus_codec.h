@@ -18,6 +18,10 @@ const uint8_t *opus_encode_frame(const int16_t *pcm, int nsamples, size_t *out_l
  * Returns number of samples written, or -1. */
 int opus_decode_frame(const uint8_t *data, size_t len, int16_t *pcm, int max_samples);
 
+/* Resets the decoder's internal state (clears CELT/SILK memories).  Call
+ * at the start of each TTS segment to avoid cross-session artefacts. */
+void opus_decoder_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

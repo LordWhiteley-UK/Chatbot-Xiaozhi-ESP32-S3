@@ -52,11 +52,11 @@ static void tool_reboot(cJSON *args, char *out, size_t out_len)
 }
 
 static const mcp_tool_t s_tools[] = {
-    { "self.get_device_status",
+    { "device.status",
       "Get the device's hardware status (mic, speaker, display, network)",
       "{\"type\":\"object\"}",
       tool_get_device_status },
-    { "self.reboot",
+    { "device.reboot",
       "Reboot the device",
       "{\"type\":\"object\"}",
       tool_reboot },

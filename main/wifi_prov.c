@@ -98,6 +98,11 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = data;
         ESP_LOGI(TAG, "connected, ip=" IPSTR, IP2STR(&ev->ip_info.ip));
+        /* Disable WiFi power management (modem sleep).  The default PS
+           type 1 sleeps the radio between beacons and can drop incoming
+           UDP packets — the xiaozhi TTS downlink is time-sensitive UDP
+           and must not be lost to power saving. */
+        esp_wifi_set_ps(WIFI_PS_NONE);
         s_retry_count = 0;
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
     }

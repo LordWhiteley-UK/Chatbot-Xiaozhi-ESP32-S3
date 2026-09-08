@@ -69,6 +69,7 @@ static void on_server_hello(const cJSON *json)
         return;
     }
     opus_decoder_setup(rate);
+    audio_set_playback_rate(rate);
     ESP_LOGI(TAG, "server hello ok, session=%s, rate=%d", s_session_id, rate);
     s_channel_open = true;
     xEventGroupSetBits(s_events, EV_HELLO_OK);
@@ -116,11 +117,10 @@ void session_dispatch_json(const char *data, size_t len)
         if (cJSON_IsString(emotion))
             app_post_event(APP_EVENT_EMOTION, cJSON_GetStringValue(emotion));
     } else if (!strcmp(t, "mcp")) {
-        const cJSON *payload = cJSON_GetObjectItemCaseSensitive(json, "payload");
-        if (cJSON_IsObject(payload)) {
-            char *s = cJSON_PrintUnformatted(payload);
-            if (s) { mcp_handle_payload(s, strlen(s)); cJSON_free(s); }
-        }
+        /* MCP disabled — do not respond to server MCP requests.  This
+           prevents the server from counting our tools and hitting its
+           32-tool limit alert. */
+        ESP_LOGD(TAG, "ignoring mcp message (mcp disabled)");
     } else if (!strcmp(t, "system")) {
         const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(json, "command");
         if (cJSON_IsString(cmd) && !strcmp(cJSON_GetStringValue(cmd), "reboot")) {
@@ -129,9 +129,10 @@ void session_dispatch_json(const char *data, size_t len)
             esp_restart();
         }
     } else if (!strcmp(t, "alert")) {
+        /* Log server alerts but don't display them on the OLED — the
+           tool-limit alert is cosmetic and clutters the display. */
         const cJSON *msg = cJSON_GetObjectItemCaseSensitive(json, "message");
-        ESP_LOGW(TAG, "alert: %.64s", cJSON_IsString(msg) ? cJSON_GetStringValue(msg) : "");
-        app_post_event(APP_EVENT_ALERT, cJSON_IsString(msg) ? cJSON_GetStringValue(msg) : "alert");
+        ESP_LOGW(TAG, "server alert: %.80s", cJSON_IsString(msg) ? cJSON_GetStringValue(msg) : "");
     } else if (!strcmp(t, "goodbye")) {
         /* server-initiated teardown of the audio session */
         ESP_LOGI(TAG, "server goodbye");
@@ -175,7 +176,7 @@ static const char *session_id_or_empty(void)
 static void send_hello(void)
 {
     send_json("{\"type\":\"hello\",\"version\":%s,"
-              "\"features\":{\"mcp\":true},"
+              "\"features\":{\"mcp\":false},"
               "\"transport\":\"websocket\","
               "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,"
               "\"channels\":1,\"frame_duration\":%d}}",
@@ -206,10 +207,6 @@ static void ws_event(void *handler_args, esp_event_base_t base, int32_t event_id
                 s_json_len = s_json_total = 0;
             }
         } else if (d->op_code == 0x2) {                           /* binary opus frame */
-            if (s_listening) {   /* spec: frames arriving while listening are dropped */
-                ESP_LOGD(TAG, "dropping downlink audio while listening");
-                break;
-            }
             audio_play((const uint8_t *)d->data_ptr, d->data_len, 0);
         }
         break;
@@ -292,7 +289,7 @@ void ws_start_listening(void)
 {
     if (!s_channel_open || s_listening) return;
     send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"start\","
-              "\"mode\":\"manual\"}", session_id_or_empty());
+              "\"mode\":\"auto\"}", session_id_or_empty());
     s_listening = true;
 }
 

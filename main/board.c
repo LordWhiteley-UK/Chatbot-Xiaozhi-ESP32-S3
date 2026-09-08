@@ -20,7 +20,7 @@ static char s_device_id[18];
 static char s_client_id[37];
 static bool s_inited;
 
-const char *app_firmware_version(void) { return "1.0.0"; }
+const char *app_firmware_version(void) { return "2.0.0"; }
 
 static void init_identity(void)
 {

@@ -40,6 +40,11 @@ int opus_decode_frame(const uint8_t *data, size_t len, int16_t *pcm, int max_sam
     return n;
 }
 
+void opus_decoder_reset(void)
+{
+    if (s_dec) opus_decoder_ctl(s_dec, OPUS_RESET_STATE);
+}
+
 /* Called by the session layer when the server hello announces a rate.
    Named *_setup to avoid clashing with libopus's own opus_decoder_init(). */
 void opus_decoder_setup(int sample_rate)
@@ -66,9 +71,10 @@ static void encoder_init(void)
         return;
     }
     opus_encoder_ctl(s_enc, OPUS_SET_BITRATE(CONFIG_OPUS_BITRATE));
-    opus_encoder_ctl(s_enc, OPUS_SET_VBR(1));
-    opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(5));   /* example default; keeps silk off the del_dec path */
-    ESP_LOGI(TAG, "encoder @ %d Hz, %d bps, %d ms frames",
+    opus_encoder_ctl(s_enc, OPUS_SET_VBR(1));          /* variable bitrate */
+    opus_encoder_ctl(s_enc, OPUS_SET_COMPLEXITY(0));   /* min CPU — critical on ESP32 */
+    opus_encoder_ctl(s_enc, OPUS_SET_DTX(1));          /* discontinuous TX: saves bandwidth in silence */
+    ESP_LOGI(TAG, "encoder @ %d Hz, %d bps, %d ms frames, complexity 0, DTX on",
              IN_SAMPLE_RATE, CONFIG_OPUS_BITRATE, FRAME_MS);
 }
 

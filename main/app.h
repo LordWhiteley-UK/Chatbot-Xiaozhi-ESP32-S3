@@ -64,7 +64,9 @@ void audio_set_utter_end_cb(audio_utter_end_cb_t cb);   /* end-of-speech (VAD) *
 void audio_start_mic(void);
 void audio_stop_mic(void);
 void audio_play(const uint8_t *opus, size_t len, int sample_rate);
-void audio_clear_playback(void);
+void audio_set_playback_rate(int sample_rate);  /* reconfigure I2S TX clock */
+void audio_play_flush(void);         /* reset decode queue + ring + decoder */
+void audio_clear_playback(void);     /* stop ring buffer output immediately  */
 bool audio_is_playing(void);
 
 /* Opus codec */

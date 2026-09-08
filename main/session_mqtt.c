@@ -1,25 +1,26 @@
 /**
- * session_mqtt.c — MQTT+UDP transport backend (docs/mqtt-udp.md).
+ * session_mqtt.c — MQTT+UDP transport backend (xiaozhi protocol v3).
  *
- * MQTT (TLS) carries JSON control messages; a UDP socket carries AES-128-CTR
- * encrypted Opus audio. Handshake: MQTT connect -> publish hello (version 3,
- * transport "udp") -> server hello carries the session id, the UDP endpoint
- * and the AES key + nonce.
+ * MQTT (TLS, port 8883) carries JSON control; a connected UDP socket
+ * carries AES-128-CTR encrypted Opus audio.  The 16-byte packet header
+ * doubles as the AES-CTR IV (nonce template with payload_len, timestamp
+ * and sequence overwritten per packet).
  *
- * Interpretations of underspecified points, verified empirically against
- * api.tenclass.net on 2026-09-07 (docs don't pin these down — flagged to the
- * user per the project ground rules):
- *   1. Broker port 8883 when the OTA `mqtt.endpoint` carries no port.
- *   2. Server->device topic is "devices/p2p/<mac-without-colons>": the OTA
- *      response's `mqtt.subscribe_topic` was literally the string "null",
- *      and the observed traffic arrives on the derived topic.
- *   3. The 16-byte audio packet header doubles as the AES-CTR IV: the server
- *      nonce is a template into which payload_len (offset 2), timestamp
- *      (offset 8) and sequence (offset 12) are written before encryption;
- *      the same 16 bytes are sent in the clear as the header.
- *   4. Conversation rounds use manual mode ("listen start/stop"); the
- *      "detect" state is only a wake-word notification and makes the
- *      server run its own wake-word pipeline on the uplink.
+ * Architectural notes — derived from analysis of the reference firmware
+ * (78/xiaozhi-esp32 and espressif/esp-iot-solution/examples/ai/xiaozhi_chat):
+ *  - UDP socket uses connect() + send()/recv() (connected mode).
+ *  - recv timeout 200 ms, send timeout 20 ms (espressif reference values).
+ *  - UDP rx task at low priority with a startup log line so we can confirm
+ *    it is alive (a race condition where s_open was set after xTaskCreate
+ *    caused the task to exit immediately in a previous build).
+ *  - Listen mode is "auto": the server detects end-of-speech with its own
+ *    VAD; the device never sends "listen stop" (matches the 78 firmware
+ *    default for non-AEC devices).
+ *  - MCP is disabled in the hello ("features":{"mcp":false}) to avoid
+ *    server-side tools/list polling that was generating ~3 MQTT messages
+ *    per second and a recurring "duplicate tool names" alert.
+ *  - TLS uses the ESP x509 certificate bundle (esp_crt_bundle_attach),
+ *    identical to both reference implementations.
  */
 #include "session_priv.h"
 #include "app.h"
@@ -27,13 +28,14 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <errno.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "mqtt_client.h"
 #include "esp_crt_bundle.h"
-#include "psa/crypto.h"   /* mbedtls 4 (IDF v6): AES via PSA — hw-accelerated on S3 */
+#include "psa/crypto.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "cJSON.h"
@@ -46,6 +48,7 @@ static const char *TAG = "mqtt_udp";
 #define EV_HELLO_OK  BIT0
 #define EV_CLOSED    BIT1
 
+/* ── session state ──────────────────────────────────────────────── */
 static esp_mqtt_client_handle_t s_mqtt;
 static EventGroupHandle_t s_ev;
 
@@ -56,19 +59,24 @@ static volatile bool s_listening;
 static char s_pub_topic[64];
 static char s_sub_topic[80];
 
+/* UDP socket + AES */
 static int s_sock = -1;
+static struct sockaddr_in s_udp_dst;
 static psa_key_id_t s_aes_key;
 static bool s_aes_ready;
-static uint8_t s_nonce[16];
-static uint32_t s_tx_seq;
-static uint32_t s_rx_seq;
+static uint8_t s_nonce[16];         /* server-supplied IV template    */
+static uint32_t s_tx_seq;           /* uplink sequence counter        */
+static uint32_t s_rx_seq;           /* downlink (anti-replay)         */
 static volatile int s_downlink_rate;
 
-/* reassembly for MQTT messages that arrive in multiple data events */
+/* diagnostics */
+static int s_rx_cnt, s_tx_cnt, s_rx_bad;
+
+/* MQTT fragment reassembly */
 static char s_json_buf[4096];
 static size_t s_json_len;
 
-/* ---- helpers ---- */
+/* ── helpers ────────────────────────────────────────────────────── */
 static void send_json_str(const char *s)
 {
     if (!s_mqtt || !s_pub_topic[0]) return;
@@ -86,27 +94,82 @@ static void send_json(const char *fmt, ...)
     send_json_str(buf);
 }
 
-static const char *session_id_or_empty(void)
-{
-    return s_session_id[0] ? s_session_id : "";
-}
+static const char *sid(void) { return s_session_id[0] ? s_session_id : ""; }
 
-/* ---- hello response: set up UDP + AES ---- */
-static void udp_rx_task(void *arg);
-
+/* ── UDP close ──────────────────────────────────────────────────── */
 static void udp_close(void)
 {
-    if (s_sock >= 0) {
-        close(s_sock);
-        s_sock = -1;
-    }
+    if (s_sock >= 0) { close(s_sock); s_sock = -1; }
 }
 
+/* ── UDP receive task ───────────────────────────────────────────── */
+static void udp_rx_task(void *arg)
+{
+    static uint8_t pkt[1600];
+    int timeout_cnt = 0;
+    ESP_LOGI(TAG, "udp_rx_task started (sock=%d, open=%d)", s_sock, (int)s_open);
+
+    while (s_open && s_sock >= 0) {
+        int n = lwip_recv(s_sock, pkt, sizeof(pkt), 0);
+        if (n < 0) {
+            /* EAGAIN / ETIMEDOUT — normal timeout, keep waiting */
+            if (++timeout_cnt <= 3 || timeout_cnt % 50 == 0)
+                ESP_LOGI(TAG, "udp recv timeout #%d (errno %d, tx=%d)",
+                         timeout_cnt, (int)errno, s_tx_cnt);
+            continue;
+        }
+        if (n == 0) continue;
+        timeout_cnt = 0;
+        s_rx_cnt++;
+        if (s_rx_cnt <= 10)
+            ESP_LOGI(TAG, "udp rx #%d: %d bytes", s_rx_cnt, n);
+
+        /* validate header */
+        if (n < 17 || pkt[0] != 0x01) {
+            if (++s_rx_bad <= 5 || s_rx_bad % 100 == 0)
+                ESP_LOGW(TAG, "udp rx drop: %d bytes, type=0x%02x", n, pkt[0]);
+            continue;
+        }
+        int plen = (pkt[2] << 8) | pkt[3];
+        if (16 + plen > n) {
+            if (++s_rx_bad <= 5 || s_rx_bad % 100 == 0)
+                ESP_LOGW(TAG, "udp rx drop: payload_len %d > %d", plen, n - 16);
+            continue;
+        }
+        uint32_t seq = ((uint32_t)pkt[12] << 24) | ((uint32_t)pkt[13] << 16) |
+                       ((uint32_t)pkt[14] << 8) | pkt[15];
+        if (s_rx_seq && (int32_t)(seq - s_rx_seq) <= 0) continue;  /* replay */
+        s_rx_seq = seq;
+
+        /* AES-128-CTR decrypt — the 16-byte header IS the IV */
+        uint8_t plain[1600];
+        size_t olen, olen2;
+        psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
+        psa_status_t st =
+            psa_cipher_decrypt_setup(&op, s_aes_key, PSA_ALG_CTR);
+        if (st == PSA_SUCCESS) st = psa_cipher_set_iv(&op, pkt, 16);
+        if (st == PSA_SUCCESS) st = psa_cipher_update(&op, pkt + 16, plen,
+                                                      plain, sizeof(plain), &olen);
+        if (st == PSA_SUCCESS) st = psa_cipher_finish(&op, plain + olen,
+                                                      sizeof(plain) - olen, &olen2);
+        if (st != PSA_SUCCESS) {
+            psa_cipher_abort(&op);
+            ESP_LOGE(TAG, "decrypt failed (seq %lu)", (unsigned long)seq);
+            continue;
+        }
+        /* forward to decode pipeline — the app gates by state */
+        audio_play(plain, olen + olen2, s_downlink_rate);
+    }
+    ESP_LOGI(TAG, "udp_rx_task exiting (open=%d, sock=%d)", (int)s_open, s_sock);
+    vTaskDelete(NULL);
+}
+
+/* ── hello response: set up UDP + AES ───────────────────────────── */
 static void on_hello(const cJSON *json)
 {
-    const cJSON *sid = cJSON_GetObjectItemCaseSensitive(json, "session_id");
-    if (sid && cJSON_IsString(sid))
-        strlcpy(s_session_id, cJSON_GetStringValue(sid), sizeof(s_session_id));
+    const cJSON *sid_j = cJSON_GetObjectItemCaseSensitive(json, "session_id");
+    if (sid_j && cJSON_IsString(sid_j))
+        strlcpy(s_session_id, cJSON_GetStringValue(sid_j), sizeof(s_session_id));
 
     const cJSON *ap = cJSON_GetObjectItemCaseSensitive(json, "audio_params");
     int rate = 24000;
@@ -117,10 +180,10 @@ static void on_hello(const cJSON *json)
 
     const cJSON *udp = cJSON_GetObjectItemCaseSensitive(json, "udp");
     if (!cJSON_IsObject(udp)) { ESP_LOGE(TAG, "hello: no udp block"); return; }
-    const cJSON *srv = cJSON_GetObjectItemCaseSensitive(udp, "server");
-    const cJSON *prt = cJSON_GetObjectItemCaseSensitive(udp, "port");
-    const cJSON *key = cJSON_GetObjectItemCaseSensitive(udp, "key");
-    const cJSON *nce = cJSON_GetObjectItemCaseSensitive(udp, "nonce");
+    const cJSON *srv  = cJSON_GetObjectItemCaseSensitive(udp, "server");
+    const cJSON *prt  = cJSON_GetObjectItemCaseSensitive(udp, "port");
+    const cJSON *key  = cJSON_GetObjectItemCaseSensitive(udp, "key");
+    const cJSON *nce  = cJSON_GetObjectItemCaseSensitive(udp, "nonce");
     if (!cJSON_IsString(srv) || !cJSON_IsNumber(prt) ||
         !cJSON_IsString(key) || !cJSON_IsString(nce)) {
         ESP_LOGE(TAG, "hello: incomplete udp block");
@@ -129,7 +192,7 @@ static void on_hello(const cJSON *json)
     const char *server = cJSON_GetStringValue(srv);
     int port = prt->valueint;
 
-    /* hex-decode the 128-bit key and nonce */
+    /* hex-decode 128-bit key + nonce */
     uint8_t aes_key[16];
     const char *kh = cJSON_GetStringValue(key);
     const char *nh = cJSON_GetStringValue(nce);
@@ -139,113 +202,102 @@ static void on_hello(const cJSON *json)
     }
     for (int i = 0; i < 16; i++) {
         unsigned v;
-        if (sscanf(kh + 2 * i, "%2x", &v) != 1) { ESP_LOGE(TAG, "bad key hex"); return; }
+        if (sscanf(kh + 2*i, "%2x", &v) != 1) return;
         aes_key[i] = v;
-        if (sscanf(nh + 2 * i, "%2x", &v) != 1) { ESP_LOGE(TAG, "bad nonce hex"); return; }
+        if (sscanf(nh + 2*i, "%2x", &v) != 1) return;
         s_nonce[i] = v;
     }
 
+    /* import AES key into PSA */
     if (s_aes_ready) psa_destroy_key(s_aes_key);
     psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_type(&attrs, PSA_KEY_TYPE_AES);
     psa_set_key_bits(&attrs, 128);
     psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_ENCRYPT | PSA_KEY_USAGE_DECRYPT);
     psa_set_key_algorithm(&attrs, PSA_ALG_CTR);
-    psa_status_t st = psa_import_key(&attrs, aes_key, sizeof(aes_key), &s_aes_key);
-    psa_reset_key_attributes(&attrs);
-    if (st != PSA_SUCCESS) {
-        ESP_LOGE(TAG, "aes key import failed: %d", (int)st);
+    if (psa_import_key(&attrs, aes_key, 16, &s_aes_key) != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "aes key import failed");
         return;
     }
     s_aes_ready = true;
     s_tx_seq = 0;
     s_rx_seq = 0;
+    memset(aes_key, 0, sizeof(aes_key));
 
     opus_decoder_setup(rate);
     s_downlink_rate = rate;
+    /* Reconfigure I2S TX to the downlink sample rate BEFORE any audio arrives.
+       This avoids disabling/enabling the I2S channel during playback, which
+       races with the play_task and was causing a crash after TTS_STOP. */
+    audio_set_playback_rate(rate);
 
+    /* create + connect UDP socket */
     udp_close();
     s_sock = lwip_socket(AF_INET, SOCK_DGRAM, 0);
     if (s_sock < 0) { ESP_LOGE(TAG, "udp socket failed"); return; }
 
-    struct sockaddr_in dst = { 0 };
-    dst.sin_family = AF_INET;
-    dst.sin_port = lwip_htons((uint16_t)port);
-    if (inet_aton(server, &dst.sin_addr) == 0) {
-        /* endpoint may be a hostname */
-        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *res = NULL;
+    memset(&s_udp_dst, 0, sizeof(s_udp_dst));
+    s_udp_dst.sin_family = AF_INET;
+    s_udp_dst.sin_port = lwip_htons((uint16_t)port);
+    if (inet_aton(server, &s_udp_dst.sin_addr) == 0) {
+        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *res;
         if (lwip_getaddrinfo(server, NULL, &hints, &res) != 0 || !res) {
-            ESP_LOGE(TAG, "cannot resolve udp server %s", server);
+            ESP_LOGE(TAG, "cannot resolve %s", server);
             udp_close();
             return;
         }
-        dst.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
-        char ipstr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &dst.sin_addr, ipstr, sizeof(ipstr));
-        ESP_LOGI(TAG, "udp server %s -> %s", server, ipstr);
+        s_udp_dst.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
         lwip_freeaddrinfo(res);
     }
-    if (lwip_connect(s_sock, (struct sockaddr *)&dst, sizeof(dst)) != 0) {
-        ESP_LOGE(TAG, "udp connect failed");
+
+    if (lwip_connect(s_sock, (struct sockaddr *)&s_udp_dst, sizeof(s_udp_dst)) < 0) {
+        ESP_LOGE(TAG, "udp connect failed (errno %d)", errno);
         udp_close();
         return;
     }
-    int tv_ms = 2000;
-    lwip_setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &tv_ms, sizeof(tv_ms));
 
-    /* rx pump for downlink audio */
-    xTaskCreate(udp_rx_task, "udp_rx", 4096, NULL, 8, NULL);
+    /* log local port (NAT mapping verification) */
+    struct sockaddr_in local_sa = { 0 };
+    socklen_t local_len = sizeof(local_sa);
+    if (getsockname(s_sock, (struct sockaddr *)&local_sa, &local_len) == 0)
+        ESP_LOGI(TAG, "udp connected, local port %d",
+                 (int)lwip_ntohs(local_sa.sin_port));
 
+    /* 200 ms recv timeout, 20 ms send timeout (espressif reference values) */
+    struct timeval rtv = { .tv_usec = 200000 };
+    lwip_setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    struct timeval stv = { .tv_usec = 20000 };
+    lwip_setsockopt(s_sock, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
+
+    /* NAT hole-punch: send a 16-byte header with 0-byte payload */
+    {
+        uint8_t probe[16];
+        memcpy(probe, s_nonce, 16);
+        uint32_t ts = (uint32_t)(esp_timer_get_time() / 1000);
+        probe[2] = 0; probe[3] = 0;
+        probe[8]  = (uint8_t)(ts >> 24); probe[9]  = (uint8_t)(ts >> 16);
+        probe[10] = (uint8_t)(ts >> 8);  probe[11] = (uint8_t)(ts);
+        probe[12] = probe[13] = probe[14] = probe[15] = 0;
+        int pr = lwip_send(s_sock, probe, 16, 0);
+        ESP_LOGI(TAG, "udp probe sent (%d bytes)", pr);
+    }
+
+    s_rx_cnt = s_tx_cnt = s_rx_bad = 0;
+
+    /* CRITICAL: set s_open BEFORE creating the task.  The task has higher
+       priority than the MQTT event handler and preempts xTaskCreate
+       immediately — if s_open is still false it exits before recv(). */
     s_open = true;
+
+    if (xTaskCreate(udp_rx_task, "udp_rx", 6144, NULL, 2, NULL) != pdTRUE)
+        ESP_LOGE(TAG, "udp_rx_task create failed");
+
     ESP_LOGI(TAG, "session %s ready, udp %s:%d, downlink %d Hz",
              s_session_id, server, port, rate);
     xEventGroupSetBits(s_ev, EV_HELLO_OK);
 }
 
-/* ---- downlink audio pump ---- */
-static void udp_rx_task(void *arg)
-{
-    static uint8_t pkt[1600];
-    while (s_open && s_sock >= 0) {
-        int n = lwip_recv(s_sock, pkt, sizeof(pkt), 0);
-        if (n < 0) continue;                     /* timeout or transient */
-        if (n < 20 || pkt[0] != 0x01) continue;  /* not an audio packet */
-        int plen = (pkt[2] << 8) | pkt[3];
-        if (16 + plen > n) continue;             /* malformed */
-        uint32_t seq = ((uint32_t)pkt[12] << 24) | ((uint32_t)pkt[13] << 16) |
-                       ((uint32_t)pkt[14] << 8) | pkt[15];
-        if (s_rx_seq && (int32_t)(seq - s_rx_seq) <= 0) continue;   /* anti-replay */
-        s_rx_seq = seq;
-        uint8_t plain[1600];
-        size_t olen, olen2;
-        /* multipart: the IV is the packet header itself, so the one-shot
-           psa_cipher_decrypt (which expects a prepended IV) can't be used */
-        psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
-        if (psa_cipher_decrypt_setup(&op, s_aes_key, PSA_ALG_CTR) != PSA_SUCCESS ||
-            psa_cipher_set_iv(&op, pkt, 16) != PSA_SUCCESS ||
-            psa_cipher_update(&op, pkt + 16, plen, plain, sizeof(plain), &olen) != PSA_SUCCESS ||
-            psa_cipher_finish(&op, plain + olen, sizeof(plain) - olen, &olen2) != PSA_SUCCESS) {
-            psa_cipher_abort(&op);
-            ESP_LOGE(TAG, "decrypt failed");
-            continue;
-        }
-        if (olen + olen2 != (size_t)plen) {
-            ESP_LOGE(TAG, "decrypt size mismatch");
-            continue;
-        }
-        if (s_listening) {                     /* half-duplex: not while we talk */
-            static int s_dropped;
-            if (++s_dropped % 50 == 1)
-                ESP_LOGW(TAG, "dropping downlink audio while listening (%d frames)",
-                         s_dropped);
-            continue;
-        }
-        audio_play(plain, plen, s_downlink_rate);
-    }
-    vTaskDelete(NULL);
-}
-
-/* ---- MQTT events ---- */
+/* ── MQTT events ────────────────────────────────────────────────── */
 static void mqtt_event(void *args, esp_event_base_t base, int32_t id, void *data)
 {
     esp_mqtt_event_handle_t e = data;
@@ -254,16 +306,16 @@ static void mqtt_event(void *args, esp_event_base_t base, int32_t id, void *data
         ESP_LOGI(TAG, "mqtt connected");
         esp_mqtt_client_subscribe(s_mqtt, s_sub_topic, 0);
         send_json("{\"type\":\"hello\",\"version\":3,\"transport\":\"udp\","
-                  "\"features\":{\"mcp\":true},"
+                  "\"features\":{\"mcp\":false},"
                   "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,"
                   "\"channels\":1,\"frame_duration\":%d}}",
                   CONFIG_OPUS_FRAME_DURATION_MS);
-        ESP_LOGI(TAG, "hello sent, waiting for server hello");
+        ESP_LOGI(TAG, "hello sent (v3, udp, mcp off)");
         break;
     case MQTT_EVENT_DATA: {
         if (!e->data_len) break;
         if (e->current_data_offset > 0) {
-            /* continuation fragment of a multi-part message */
+            /* continuation fragment */
             if (s_json_len + (size_t)e->data_len < sizeof(s_json_buf)) {
                 memcpy(s_json_buf + s_json_len, e->data, e->data_len);
                 s_json_len += e->data_len;
@@ -273,14 +325,14 @@ static void mqtt_event(void *args, esp_event_base_t base, int32_t id, void *data
                 s_json_len = 0;
             }
         } else if ((size_t)e->data_len < (size_t)e->total_data_len) {
-            /* first fragment of a multi-part message */
+            /* first fragment */
             s_json_len = 0;
             if ((size_t)e->data_len < sizeof(s_json_buf)) {
                 memcpy(s_json_buf, e->data, e->data_len);
                 s_json_len = e->data_len;
             }
         } else {
-            /* complete message in one event */
+            /* complete message */
             session_dispatch_json(e->data, e->data_len);
         }
         break;
@@ -292,13 +344,11 @@ static void mqtt_event(void *args, esp_event_base_t base, int32_t id, void *data
             s_listening = false;
             udp_close();
             xEventGroupSetBits(s_ev, EV_CLOSED);
-            app_post_event(APP_EVENT_WS_CLOSED, NULL);   /* app reconnects */
+            app_post_event(APP_EVENT_WS_CLOSED, NULL);
         }
         break;
     case MQTT_EVENT_ERROR:
-        ESP_LOGE(TAG, "mqtt error: %s",
-                 e->error_handle && e->error_handle->error_type != MQTT_ERROR_TYPE_NONE
-                     ? "see error_handle" : "unknown");
+        ESP_LOGE(TAG, "mqtt error");
         if (!s_open) xEventGroupSetBits(s_ev, EV_CLOSED);
         break;
     default:
@@ -306,7 +356,7 @@ static void mqtt_event(void *args, esp_event_base_t base, int32_t id, void *data
     }
 }
 
-/* ---- backend API ---- */
+/* ── public API ─────────────────────────────────────────────────── */
 bool mqttsess_is_open(void) { return s_open; }
 
 int mqttsess_start(void)
@@ -321,7 +371,7 @@ int mqttsess_start(void)
     xEventGroupClearBits(s_ev, EV_HELLO_OK | EV_CLOSED);
     session_set_hello_handler(on_hello);
 
-    /* broker uri — 8883 is the standard MQTT-over-TLS port [interpretation 1] */
+    /* broker URI — default port 8883 for TLS */
     static char uri[192];
     const char *ep = o->mqtt_endpoint;
     uri[0] = 0;
@@ -329,7 +379,7 @@ int mqttsess_start(void)
     strlcat(uri, ep, sizeof(uri));
     if (!strstr(ep, "://") && !strchr(ep, ':')) strlcat(uri, ":8883", sizeof(uri));
 
-    /* publish topic from OTA; subscribe topic derived [interpretation 2] */
+    /* topics */
     strlcpy(s_pub_topic,
             o->mqtt_publish_topic[0] ? o->mqtt_publish_topic : "device-server",
             sizeof(s_pub_topic));
@@ -345,8 +395,6 @@ int mqttsess_start(void)
         snprintf(s_sub_topic, sizeof(s_sub_topic), "devices/p2p/%s", mac);
     }
     ESP_LOGI(TAG, "mqtt uri=%s pub='%s' sub='%s'", uri, s_pub_topic, s_sub_topic);
-    ESP_LOGI(TAG, "mqtt cid='%s' user='%s' pass_len=%d",
-             o->mqtt_client_id, o->mqtt_username, (int)strlen(o->mqtt_password));
 
     if (s_mqtt) { esp_mqtt_client_destroy(s_mqtt); s_mqtt = NULL; }
 
@@ -357,12 +405,8 @@ int mqttsess_start(void)
             .username = o->mqtt_username,
             .authentication = { .password = o->mqtt_password },
         },
-        .session = {
-            .keepalive = 240,                 /* docs/mqtt-udp.md §6.1 */
-        },
-        .network = {
-            .disable_auto_reconnect = true,   /* app owns reconnection */
-        },
+        .session = { .keepalive = 240 },
+        .network = { .disable_auto_reconnect = true },
         .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
@@ -387,8 +431,8 @@ void mqttsess_stop(void)
     if (s_aes_ready) { psa_destroy_key(s_aes_key); s_aes_ready = false; }
     if (s_mqtt) {
         if (s_session_id[0] && s_pub_topic[0]) {
-            send_json("{\"session_id\":\"%s\",\"type\":\"goodbye\"}", s_session_id);
-            vTaskDelay(pdMS_TO_TICKS(100));   /* let the goodbye flush */
+            send_json("{\"session_id\":\"%s\",\"type\":\"goodbye\"}", sid());
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
         esp_mqtt_client_destroy(s_mqtt);
         s_mqtt = NULL;
@@ -399,42 +443,43 @@ void mqttsess_stop(void)
 void mqttsess_start_listening(void)
 {
     if (!s_open || s_listening) return;
-    /* manual mode round: stream mic audio, server transcribes (spec
-       websocket.md §6 — "detect" is only a wake-word notification) */
-    ESP_LOGI(TAG, ">> listen start (manual)");
-    send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"start\",\"mode\":\"manual\"}",
-              session_id_or_empty());
+    /* AUTO mode: the server detects end-of-speech with its own VAD.
+       The device never sends "listen stop" — the server handles it. */
+    ESP_LOGI(TAG, ">> listen start (auto)");
+    send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"start\","
+              "\"mode\":\"auto\"}", sid());
     s_listening = true;
 }
 
 void mqttsess_stop_listening(void)
 {
+    /* In AUTO mode the server stops listening on its own, but we keep
+       this for completeness / barge-in scenarios. */
     if (!s_listening) return;
     ESP_LOGI(TAG, ">> listen stop");
-    send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"stop\",\"mode\":\"manual\"}",
-              session_id_or_empty());
+    send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"stop\"}", sid());
     s_listening = false;
 }
 
 void mqttsess_send_abort(void)
 {
     if (!s_open) return;
-    ESP_LOGI(TAG, ">> abort (wake_word_detected)");
-    send_json("{\"session_id\":\"%s\",\"type\":\"abort\",\"reason\":\"wake_word_detected\"}",
-              session_id_or_empty());
+    ESP_LOGI(TAG, ">> abort");
+    send_json("{\"session_id\":\"%s\",\"type\":\"abort\","
+              "\"reason\":\"wake_word_detected\"}", sid());
 }
 
 void mqttsess_send_audio(const uint8_t *opus, size_t len)
 {
     if (!s_open || s_sock < 0 || len == 0 || len > 1400) return;
 
-    /* header == AES-CTR IV [interpretation 3] */
+    /* header = copy of nonce template with per-packet fields overwritten */
     uint8_t hdr[16];
-    uint32_t ts = (uint32_t)(esp_timer_get_time() / 1000);   /* ms uptime */
+    uint32_t ts  = (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t seq = ++s_tx_seq;
     memcpy(hdr, s_nonce, 16);
-    hdr[2] = (uint8_t)(len >> 8);
-    hdr[3] = (uint8_t)(len & 0xff);
+    hdr[2]  = (uint8_t)(len >> 8);
+    hdr[3]  = (uint8_t)(len & 0xff);
     hdr[8]  = (uint8_t)(ts >> 24);  hdr[9]  = (uint8_t)(ts >> 16);
     hdr[10] = (uint8_t)(ts >> 8);   hdr[11] = (uint8_t)(ts);
     hdr[12] = (uint8_t)(seq >> 24); hdr[13] = (uint8_t)(seq >> 16);
@@ -443,27 +488,33 @@ void mqttsess_send_audio(const uint8_t *opus, size_t len)
     static uint8_t pkt[1416];
     memcpy(pkt, hdr, 16);
 
-    /* multipart CTR encrypt — one-shot psa_cipher_encrypt generates its own
-       IV, but the wire protocol requires our header to BE the IV */
+    /* AES-128-CTR encrypt — multipart (header is the IV, not prepended by API) */
     psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
     size_t olen, olen2;
-    if (psa_cipher_encrypt_setup(&op, s_aes_key, PSA_ALG_CTR) != PSA_SUCCESS ||
-        psa_cipher_set_iv(&op, hdr, 16) != PSA_SUCCESS ||
-        psa_cipher_update(&op, opus, len, pkt + 16, sizeof(pkt) - 16, &olen) != PSA_SUCCESS ||
-        psa_cipher_finish(&op, pkt + 16 + olen, sizeof(pkt) - 16 - olen, &olen2) != PSA_SUCCESS) {
+    psa_status_t st = psa_cipher_encrypt_setup(&op, s_aes_key, PSA_ALG_CTR);
+    if (st == PSA_SUCCESS) st = psa_cipher_set_iv(&op, hdr, 16);
+    if (st == PSA_SUCCESS) st = psa_cipher_update(&op, opus, len,
+                                                   pkt + 16, sizeof(pkt) - 16, &olen);
+    if (st == PSA_SUCCESS) st = psa_cipher_finish(&op, pkt + 16 + olen,
+                                                   sizeof(pkt) - 16 - olen, &olen2);
+    if (st != PSA_SUCCESS) {
         psa_cipher_abort(&op);
         return;
     }
-    lwip_send(s_sock, pkt, 16 + olen + olen2, 0);
+    s_tx_cnt++;
+    if (s_tx_cnt <= 5)
+        ESP_LOGI(TAG, "udp tx #%d: %d bytes", s_tx_cnt, (int)(16 + olen + olen2));
+    int sent = lwip_send(s_sock, pkt, 16 + olen + olen2, 0);
+    if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+        ESP_LOGW(TAG, "udp send failed (errno %d)", (int)errno);
 }
 
 void mqttsess_send_mcp(const char *payload_json)
 {
     send_json("{\"session_id\":\"%s\",\"type\":\"mcp\",\"payload\":%s}",
-              session_id_or_empty(), payload_json);
+              sid(), payload_json);
 }
 
-/* one-time init */
 void mqttsess_init(void)
 {
     if (!s_ev) s_ev = xEventGroupCreate();
