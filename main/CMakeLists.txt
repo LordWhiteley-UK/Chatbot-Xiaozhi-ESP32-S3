@@ -2,6 +2,7 @@ idf_component_register(
     SRCS "main.c"
          "board.c"
          "display.c"
+         "face_display.c"
          "audio.c"
          "opus_codec.c"
          "wifi_prov.c"

@@ -135,7 +135,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 6.0.2
+    version: 5.3.3
 direct_dependencies:
 - 78/esp-opus
 - espressif/cjson
@@ -145,4 +145,4 @@ direct_dependencies:
 - idf
 manifest_hash: 0dc876763d835d4e901e4fb06e2a3066279a07e7e994f6a330212ccac796098e
 target: esp32s3
-version: 3.0.0
+version: 2.0.0

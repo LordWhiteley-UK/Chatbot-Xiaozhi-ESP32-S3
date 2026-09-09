@@ -5,6 +5,15 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
+# Only small allocs (<4 KB) use internal RAM; larger ones (task stacks,
+# ring buffers) go to PSRAM to avoid exhausting the ~249 KB of internal
+# RAM that WiFi already consumes ~126 KB of.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# Keep 64 KB of internal RAM in reserve: any allocation NOT tagged
+# MALLOC_CAP_INTERNAL (large task stacks, ring buffer, Opus queue/state)
+# is pushed to the 8 MB PSRAM once internal free dips below this.  WiFi
+# and I2S DMA (which require internal RAM) are unaffected.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 
 # GPIO43/44 are used for the mic, so console must not be UART0
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
@@ -15,3 +24,22 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_SR_WN_WN9_COMPUTER_TTS=y
+
+# MQTT server (api.tenclass.net:8883) presents a certificate whose root CA
+# is not in the ESP default cert bundle.  Enable insecure-skip so the MQTT
+# connection can still establish TLS (encryption intact, identity not
+# verified).  OTA HTTPS still uses the cert bundle for full verification.
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+
+# mbedTLS: use the default (PSRAM-capable) allocator instead of
+# INTERNAL_MEM_ALLOC.  With internal-only allocation, the dynamic TLS
+# record buffer (4437 bytes) fails mid-session once the audio tasks,
+# wake-word engine and face task have fragmented internal RAM — the
+# handshake succeeds at boot but the first MQTT publish after reconnect
+# crashes with alloc(4437) failed.  Default allocation lets the >4 KB
+# record buffer land in the 8 MB PSRAM; small allocs still go internal.
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y

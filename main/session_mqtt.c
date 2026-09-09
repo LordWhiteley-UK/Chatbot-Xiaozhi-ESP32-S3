@@ -19,8 +19,9 @@
  *  - MCP is disabled in the hello ("features":{"mcp":false}) to avoid
  *    server-side tools/list polling that was generating ~3 MQTT messages
  *    per second and a recurring "duplicate tool names" alert.
- *  - TLS uses the ESP x509 certificate bundle (esp_crt_bundle_attach),
- *    identical to both reference implementations.
+ *  - TLS uses the ESP x509 certificate bundle for OTA HTTPS; the MQTT broker's
+ *    root CA is not in the bundle, so MQTT TLS skips cert verification (encryption
+ *    is still active).  See sdkconfig CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY.
  */
 #include "session_priv.h"
 #include "app.h"
@@ -34,7 +35,6 @@
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "mqtt_client.h"
-#include "esp_crt_bundle.h"
 #include "psa/crypto.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -110,7 +110,7 @@ static void udp_rx_task(void *arg)
     ESP_LOGI(TAG, "udp_rx_task started (sock=%d, open=%d)", s_sock, (int)s_open);
 
     while (s_open && s_sock >= 0) {
-        int n = lwip_recv(s_sock, pkt, sizeof(pkt), 0);
+        int n = lwip_recvfrom(s_sock, pkt, sizeof(pkt), 0, NULL, NULL);
         if (n < 0) {
             /* EAGAIN / ETIMEDOUT — normal timeout, keep waiting */
             if (++timeout_cnt <= 3 || timeout_cnt % 50 == 0)
@@ -250,18 +250,16 @@ static void on_hello(const cJSON *json)
         lwip_freeaddrinfo(res);
     }
 
-    if (lwip_connect(s_sock, (struct sockaddr *)&s_udp_dst, sizeof(s_udp_dst)) < 0) {
-        ESP_LOGE(TAG, "udp connect failed (errno %d)", errno);
-        udp_close();
-        return;
-    }
+    /* Keep the socket UNCONNECTED: a connected UDP socket silently drops
+       any datagram whose source IP:port differs from the connected peer,
+       and the backend may send TTS audio from a different media-server
+       address than the one advertised in the hello response (this caused
+       "TTS_START received but zero udp rx" symptoms).  We use sendto() for
+       uplink/probe and recvfrom() for downlink; the packet header check +
+       AES decryption validate authenticity of what we accept. */
 
-    /* log local port (NAT mapping verification) */
-    struct sockaddr_in local_sa = { 0 };
-    socklen_t local_len = sizeof(local_sa);
-    if (getsockname(s_sock, (struct sockaddr *)&local_sa, &local_len) == 0)
-        ESP_LOGI(TAG, "udp connected, local port %d",
-                 (int)lwip_ntohs(local_sa.sin_port));
+    /* local port is only bound after the first send — log it after the
+       NAT hole-punch probe below, not here (otherwise it shows port 0) */
 
     /* 200 ms recv timeout, 20 ms send timeout (espressif reference values) */
     struct timeval rtv = { .tv_usec = 200000 };
@@ -278,8 +276,13 @@ static void on_hello(const cJSON *json)
         probe[8]  = (uint8_t)(ts >> 24); probe[9]  = (uint8_t)(ts >> 16);
         probe[10] = (uint8_t)(ts >> 8);  probe[11] = (uint8_t)(ts);
         probe[12] = probe[13] = probe[14] = probe[15] = 0;
-        int pr = lwip_send(s_sock, probe, 16, 0);
-        ESP_LOGI(TAG, "udp probe sent (%d bytes)", pr);
+        int pr = lwip_sendto(s_sock, probe, 16, 0,
+                             (struct sockaddr *)&s_udp_dst, sizeof(s_udp_dst));
+        struct sockaddr_in local_sa = { 0 };
+        socklen_t local_len = sizeof(local_sa);
+        if (getsockname(s_sock, (struct sockaddr *)&local_sa, &local_len) == 0)
+            ESP_LOGI(TAG, "udp probe sent (%d bytes), local port %d",
+                     pr, (int)lwip_ntohs(local_sa.sin_port));
     }
 
     s_rx_cnt = s_tx_cnt = s_rx_bad = 0;
@@ -306,6 +309,7 @@ static void mqtt_event(void *args, esp_event_base_t base, int32_t id, void *data
         ESP_LOGI(TAG, "mqtt connected");
         esp_mqtt_client_subscribe(s_mqtt, s_sub_topic, 0);
         send_json("{\"type\":\"hello\",\"version\":3,\"transport\":\"udp\","
+                  "\"language\":\"en\","
                   "\"features\":{\"mcp\":false},"
                   "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,"
                   "\"channels\":1,\"frame_duration\":%d}}",
@@ -407,7 +411,9 @@ int mqttsess_start(void)
         },
         .session = { .keepalive = 240 },
         .network = { .disable_auto_reconnect = true },
-        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+        /* The MQTT broker's root CA is not in the ESP cert bundle, so we
+           skip cert verification (TLS encryption is still active).  OTA
+           HTTPS keeps full cert-bundle verification. */
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
     if (!s_mqtt) return -1;
@@ -453,11 +459,13 @@ void mqttsess_start_listening(void)
 
 void mqttsess_stop_listening(void)
 {
-    /* In AUTO mode the server stops listening on its own, but we keep
-       this for completeness / barge-in scenarios. */
-    if (!s_listening) return;
-    ESP_LOGI(TAG, ">> listen stop");
-    send_json("{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"stop\"}", sid());
+    /* AUTO mode: the server's VAD decides end-of-speech; the device must
+       NOT send "listen stop" (matches the 78 reference firmware for
+       non-AEC devices).  Sending it correlated with the server flushing a
+       residual VAD segment and producing a spurious STT ("Yeah.") — and
+       a whole extra TTS round — ~400 ms after every completed reply.
+       This function now only clears the local bookkeeping flag so the
+       next round can send "listen start" again. */
     s_listening = false;
 }
 
@@ -504,7 +512,8 @@ void mqttsess_send_audio(const uint8_t *opus, size_t len)
     s_tx_cnt++;
     if (s_tx_cnt <= 5)
         ESP_LOGI(TAG, "udp tx #%d: %d bytes", s_tx_cnt, (int)(16 + olen + olen2));
-    int sent = lwip_send(s_sock, pkt, 16 + olen + olen2, 0);
+    int sent = lwip_sendto(s_sock, pkt, 16 + olen + olen2, 0,
+                           (struct sockaddr *)&s_udp_dst, sizeof(s_udp_dst));
     if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
         ESP_LOGW(TAG, "udp send failed (errno %d)", (int)errno);
 }

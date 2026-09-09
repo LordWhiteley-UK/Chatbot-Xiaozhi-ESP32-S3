@@ -28,6 +28,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -66,8 +67,23 @@ static RingbufHandle_t s_play_ring;
 static QueueHandle_t s_opus_queue;
 static TaskHandle_t s_mic_task, s_play_task, s_decode_task;
 static volatile bool s_mic_running;
+static volatile bool s_play_accept;   /* gate: accept incoming TTS packets? */
+static volatile int  s_play_level;    /* smoothed playback amplitude for face */
+static volatile int  s_volume = 40;   /* playback volume 0-100% (software scaling) */
 static volatile int s_play_sample_rate = 16000;
 static volatile size_t s_play_pending;
+
+/* ESP-IDF 5.3 has no public ring-buffer reset; drain it instead.
+   Thread-safe vs the concurrent receive in play_task (ringbuf API allows
+   concurrent receivers; each call uses a 0-tick timeout). */
+static void play_ring_drain(void)
+{
+    size_t sz;
+    void *p;
+    while (s_play_ring &&
+           (p = xRingbufferReceiveUpTo(s_play_ring, &sz, 0, SIZE_MAX)) != NULL)
+        vRingbufferReturnItem(s_play_ring, p);
+}
 static int64_t s_mic_opened_at;
 
 void audio_start_mic(void)
@@ -78,18 +94,50 @@ void audio_start_mic(void)
 void audio_stop_mic(void)  { s_mic_running = false; }
 void audio_set_pcm_cb(audio_pcm_cb_t cb) { s_on_pcm = cb; }
 void audio_set_utter_end_cb(audio_utter_end_cb_t cb) { s_on_utter_end = cb; }
-bool audio_is_playing(void){ return s_play_pending > 0; }
+bool audio_is_playing(void)
+{
+    /* Use the ring buffer's actual fill level as ground truth.  The
+       s_play_pending counter is a diagnostic convenience only — it was
+       observed drifting one frame high and never returning to zero, which
+       made the TTS-finish logic never see "quiet" and always wait the
+       30 s deadline (device deaf for 30 s after every reply). */
+    return s_play_ring &&
+           xRingbufferGetCurFreeSize(s_play_ring) < PLAY_RING_SIZE;
+}
+
+int audio_play_level(void)
+{
+    return s_play_level;
+}
+
+void audio_set_volume(int percent)
+{
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    s_volume = percent;
+    ESP_LOGI(TAG, "volume set to %d%%", percent);
+}
 
 void audio_clear_playback(void)
 {
-    if (s_play_ring) vRingbufferReset(s_play_ring);
+    s_play_accept = false;
+    if (s_opus_queue) xQueueReset(s_opus_queue);
+    play_ring_drain();
     s_play_pending = 0;
+}
+
+void audio_stop_accept(void)
+{
+    /* Stop accepting new TTS packets but let existing audio play out. */
+    s_play_accept = false;
+    if (s_opus_queue) xQueueReset(s_opus_queue);
 }
 
 void audio_play_flush(void)
 {
+    s_play_accept = true;   /* TTS_START: accept incoming audio */
     if (s_opus_queue) xQueueReset(s_opus_queue);
-    if (s_play_ring) vRingbufferReset(s_play_ring);
+    play_ring_drain();      /* drain any leftover audio before new TTS arrives */
     s_play_pending = 0;
     opus_decoder_reset();
     ESP_LOGI(TAG, "playback flushed");
@@ -112,6 +160,7 @@ void audio_set_playback_rate(int sample_rate)
 void audio_play(const uint8_t *opus, size_t len, int sample_rate)
 {
     if (!s_opus_queue || len == 0 || len > MAX_OPUS_PKT) return;
+    if (!s_play_accept) return;   /* drop late packets after TTS_STOP */
     opus_pkt_t pkt = { .len = (int)len, .sample_rate = sample_rate };
     memcpy(pkt.data, opus, len);
     if (xQueueSend(s_opus_queue, &pkt, 0) != pdTRUE) {
@@ -143,6 +192,9 @@ static void opus_decode_task(void *arg)
             ESP_LOGW(TAG, "opus decode failed (%d bytes)", pkt.len);
             continue;
         }
+        if (!s_play_accept)
+            continue;   /* abort raced us: this packet was dequeued before
+                           xQueueReset() — drop it so it can't play later */
         if (xRingbufferSend(s_play_ring, pcm, nsamples * 2,
                             pdMS_TO_TICKS(100)) != pdTRUE)
             ESP_LOGW(TAG, "play ring full, dropping %d samples", nsamples);
@@ -187,10 +239,36 @@ static void play_task(void *arg)
     while (true) {
         void *data = xRingbufferReceiveUpTo(s_play_ring, &br,
                                             pdMS_TO_TICKS(200), sizeof(chunk));
-        if (!data) continue;
+        if (!data) {
+            /* idle: decay amplitude so the mouth closes between phrases */
+            s_play_level = (s_play_level * 3) / 4;
+            continue;
+        }
         memcpy(chunk, data, br);
         vRingbufferReturnItem(s_play_ring, data);
-        s_play_pending -= br;
+        /* track amplitude (peak of abs samples in this chunk) for the
+           face mouth: gives a live "is sound actually playing" signal. */
+        {
+            int peak = 0;
+            int nsamp = (int)(br / 2);
+            for (int i = 0; i < nsamp; i++) {
+                int v = chunk[i] < 0 ? -chunk[i] : chunk[i];
+                if (v > peak) peak = v;
+            }
+            /* smooth: rise fast, fall slow */
+            if (peak > s_play_level) s_play_level = peak;
+            else s_play_level = (s_play_level * 7 + peak) / 8;
+        }
+        /* apply software volume scaling */
+        if (s_volume < 100) {
+            int nsamp = (int)(br / 2);
+            for (int i = 0; i < nsamp; i++)
+                chunk[i] = (int16_t)((int)chunk[i] * s_volume / 100);
+        }
+        /* Clamp: audio_clear_playback() may have reset pending to 0 while
+           this chunk was on its way out — never let it underflow. */
+        if (s_play_pending >= br) s_play_pending -= br;
+        else s_play_pending = 0;
         size_t written = 0;
         while (written < br) {
             size_t w = 0;
@@ -257,12 +335,22 @@ int audio_init(audio_frame_cb_t on_encoded_frame)
     s_opus_queue = xQueueCreate(OPUS_QUEUE_LEN, sizeof(opus_pkt_t));
     if (!s_opus_queue) { ESP_LOGE(TAG, "opus queue alloc failed"); return -1; }
 
-    /* mic: 32 KB (Opus encode), decode: 24 KB (SILK decode), play: 4 KB */
-    if (xTaskCreate(mic_task, "mic", 32768, NULL, 10, &s_mic_task) != pdTRUE ||
-        xTaskCreate(opus_decode_task, "opus_dec", 24576, NULL, 8, &s_decode_task) != pdTRUE ||
-        xTaskCreate(play_task, "play", 4096, NULL, 9, &s_play_task) != pdTRUE) {
-        ESP_LOGE(TAG, "task create failed");
-        return -1;
+    /* mic: 32 KB (Opus encode), decode: 24 KB (SILK decode), play: 4 KB.
+       Log heap state so any task-create failure is diagnosable from the
+       serial log. */
+    ESP_LOGI(TAG, "heap: internal free %u (largest %u), psram free %u",
+             (unsigned)esp_get_free_internal_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    if (xTaskCreate(mic_task, "mic", 32768, NULL, 10, &s_mic_task) != pdTRUE) {
+        ESP_LOGE(TAG, "mic task create failed"); return -1;
+    }
+    if (xTaskCreate(opus_decode_task, "opus_dec", 24576, NULL, 8, &s_decode_task) != pdTRUE) {
+        ESP_LOGE(TAG, "decode task create failed"); return -1;
+    }
+    if (xTaskCreate(play_task, "play", 4096, NULL, 9, &s_play_task) != pdTRUE) {
+        ESP_LOGE(TAG, "play task create failed"); return -1;
     }
     ESP_LOGI(TAG, "audio ready: in=%dHz out=%dHz frame=%dms",
              SAMPLE_RATE_IN, s_play_sample_rate, FRAME_MS);

@@ -18,6 +18,7 @@
 
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "model_path.h"
@@ -33,6 +34,7 @@ static char s_word[MODEL_NAME_MAX_LENGTH];
 static int s_chunk;                 /* 16-bit samples per detect() call */
 static volatile bool s_armed;
 static bool s_ready;
+static int64_t s_muzzle_until;      /* discard audio until this time (echo guard) */
 
 static int16_t s_buf[512 * 16];     /* pending samples between detect steps */
 static int s_pending;
@@ -69,11 +71,26 @@ int wake_word_init(void)
 
 bool wake_word_ready(void)   { return s_ready; }
 const char *wake_word_name(void) { return s_word; }
-void wake_word_set_armed(bool armed) { s_armed = armed; }
+void wake_word_set_armed(bool armed)
+{
+    s_armed = armed;
+    if (armed) {
+        /* Flush the partial-sample buffer so the model doesn't process
+           stale audio from before the disarm period (e.g. TTS echo). */
+        s_pending = 0;
+        /* Muzzle: discard audio for 600 ms after arming so the room echo
+           of the device's own TTS output doesn't re-trigger the wake word. */
+        s_muzzle_until = esp_timer_get_time() + 600000;
+    }
+}
 
 void wake_word_feed(const int16_t *pcm, int nsamples)
 {
     if (!s_ready || !s_armed)
+        return;
+    /* Muzzle period: discard audio for a short time after arming to
+       prevent the wake word from triggering on TTS room echo. */
+    if (esp_timer_get_time() < s_muzzle_until)
         return;
 
     /* step the engine in chunk-size units, buffering the frame remainder */

@@ -53,6 +53,8 @@ void display_status_line(const char *state_text, const char *detail);
 void display_text(const char *text);          /* STT / subtitle, wrapped */
 void display_activation(const char *code);
 void display_emotion(const char *emotion);
+uint8_t *display_fb(void);          /* raw frame buffer (1024 bytes) */
+void display_flush_now(void);      /* push buffer to panel */
 
 /* Audio */
 typedef void (*audio_frame_cb_t)(const uint8_t *opus, size_t len);
@@ -67,7 +69,10 @@ void audio_play(const uint8_t *opus, size_t len, int sample_rate);
 void audio_set_playback_rate(int sample_rate);  /* reconfigure I2S TX clock */
 void audio_play_flush(void);         /* reset decode queue + ring + decoder */
 void audio_clear_playback(void);     /* stop ring buffer output immediately  */
+void audio_stop_accept(void);        /* stop accepting new TTS, let existing play */
 bool audio_is_playing(void);
+int  audio_play_level(void);   /* smoothed peak amplitude of current playback (0 = silent) */
+void audio_set_volume(int percent);  /* software volume 0-100% */
 
 /* Opus codec */
 void opus_init(void);
@@ -115,6 +120,9 @@ typedef enum {
     APP_EVENT_WAKE_WORD,
     APP_EVENT_UTTER_END,   /* device VAD: the user finished speaking */
     APP_EVENT_WS_CLOSED,
+    APP_EVENT_BTN_LONG,    /* BOOT button held >800ms (display toggle) */
+    APP_EVENT_VOL_UP,      /* external button held >800ms (volume up) */
+    APP_EVENT_VOL_DOWN,    /* external button short press (volume down) */
 } app_event_t;
 void app_post_event(app_event_t ev, const char *text);   /* copies text */
 

@@ -24,4 +24,9 @@
 /* On-board BOOT button (on the XIAO module itself, not part of external wiring) */
 #define BOARD_BUTTON_BOOT GPIO_NUM_0
 
+/* Optional external push button (momentary, to GND).
+   Wired between the D2 pad and GND; internal pull-up is enabled in code.
+   Same behaviour as BOOT: short press = wake/barge-in, long press = face. */
+#define BOARD_BUTTON_EXT  GPIO_NUM_3   /* D2 */
+
 /* USB D-/D+ are GPIO19/20 internally — never repurpose. */

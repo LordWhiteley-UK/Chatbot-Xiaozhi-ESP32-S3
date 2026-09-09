@@ -80,7 +80,7 @@ the command line, which is what the project developer uses.
 3. Press **F1** (or Cmd/Ctrl+Shift+P), type **ESP-IDF: Configure
    ESP-IDF Extension**, press Enter, choose **EXPRESS (quick install)**.
 4. In the wizard set exactly these values:
-   - **Version**: `v6.0.2`  ← this project is built against v6.0.2
+   - **Version**: `v5.3.3`  ← this project is built against v5.3.3
    - **Download server**: Espressif
    - **Install paths**: leave the defaults
    Click **Install** and wait (~10 min; it downloads the toolchain).
@@ -108,7 +108,7 @@ the command line, which is what the project developer uses.
 ### B2 — the command-line way
 
 Install prerequisites from Espressif's official walk-through (toolchain
-+ `idf.py`): <https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32s3/get-started/index.html>
++ `idf.py`): <https://docs.espressif.com/projects/esp-idf/en/v5.3.3/esp32s3/get-started/index.html>
 
 Then:
 
@@ -117,13 +117,18 @@ git clone https://github.com/LordWhiteley-UK/Chatbot-Xiaozhi-ESP32-S3.git
 cd Chatbot-Xiaozhi-ESP32-S3
 
 # macOS / Linux — once per terminal session:
-. $HOME/esp/esp-idf-v6.0.2/export.sh
+source ~/esp/esp-idf/export.sh
 
 idf.py set-target esp32s3     # one-time; picks the chip
 idf.py build                  # compiles everything
-idf.py -p <PORT> flash        # upload; see port names below
-idf.py -p <PORT> monitor      # watch the log; Ctrl+] to exit
+idf.py -p <PORT> flash monitor  # upload + watch the log; Ctrl+] to exit
 ```
+
+> **When `sdkconfig.defaults` changes** (e.g. after a `git pull`), delete
+> the old `sdkconfig` so new defaults apply:
+> ```sh
+> rm -f sdkconfig sdkconfig.old && idf.py fullclean && idf.py build
+> ```
 
 **`<PORT>` values:**
 
@@ -149,7 +154,7 @@ if something asks:
 | Parameter | Value |
 |---|---|
 | Chip / target | `esp32s3` |
-| ESP-IDF version | **v6.0.2** |
+| ESP-IDF version | **v5.3.3** |
 | Flash size | 8 MB |
 | PSRAM | Octal, 80 MHz (N8R8 module) |
 | Console | USB Serial/JTAG (not UART0 — GPIO43/44 are the mic) |
@@ -177,9 +182,33 @@ Then open
    enter it at <https://xiaozhi.me> to bind.
 4. Once bound, the screen reads **Ready — Say "Computer"**. Say the
    wake word **"Computer"** to start a conversation round; when the
-   answer finishes it returns to standby. The **BOOT** button also
-   works: press it in standby to talk without the wake word, or while
-   the assistant speaks to interrupt it.
+   answer finishes the device stays listening for **10 seconds** so you
+   can ask follow-up questions without the wake word. After 10 s of
+   silence it goes back to standby.
+
+### Button controls
+
+Both the on-board **BOOT** button and the optional **external push button**
+(see wiring below) use the same multi-press logic:
+
+| Gesture | Action |
+|---|---|
+| 1 press | Wake / barge-in (start listening, or stop the current answer) |
+| 2 presses | Volume up |
+| 3 presses | Volume down |
+| Long press (>1 s) | Toggle face / text display |
+
+Long-press to switch to the animated face: closed eyes and floating "z z"
+when sleeping, wide eyes when listening, mouth moving in sync with audio
+when talking.
+
+### Adding an external push button
+
+Wire a momentary push button between the **D2 pad** (GPIO3) and **GND**.
+No external resistor needed — the internal pull-up is enabled in code.
+D2 is the only unused broken-out pad on the XIAO ESP32-S3 with this
+project's wiring. To use a different pad, change `BOARD_BUTTON_EXT` in
+`main/board.h`.
 
 ---
 

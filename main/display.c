@@ -43,6 +43,10 @@ static void flush(void)
     esp_lcd_panel_draw_bitmap(s_panel, 0, 0, DISPLAY_W, DISPLAY_H, s_fb);
 }
 
+/* Expose buffer + flush for the face display module */
+uint8_t *display_fb(void) { return s_fb; }
+void display_flush_now(void) { flush(); }
+
 static void put_char(char c, bool invert)
 {
     if (c < FONT_FIRST || c > FONT_LAST) c = '?';
