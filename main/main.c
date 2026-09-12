@@ -8,9 +8,20 @@
  *
  * In AUTO listen mode the server detects end-of-speech with its own VAD —
  * the device sends "listen start" with mode "auto" and streams audio until
- * the server responds with TTS.  No on-device VAD, no "listen stop", no
- * conversation timeout.  After TTS_STOP the device goes back to standby
- * (wake word re-arms).  The BOOT button still works as an optional trigger.
+ * the server responds with TTS.  No on-device VAD, no "listen stop".
+ * After TTS_STOP and playback drain the device enters conversation mode:
+ * a fresh listen round for CONV_TIMEOUT_US so follow-up questions need no
+ * wake word; on timeout it goes back to standby (wake word re-arms).
+ * The buttons work as optional triggers (short press = wake/barge-in,
+ * double/triple = volume, long press = face display).
+ *
+ * Echo-avoidance invariants (all three are always true):
+ *   - the wake word is disarmed whenever the speaker may be sounding
+ *     (TTS_START → disarm; re-arm only after echo-fade delay + muzzle);
+ *   - mic uplink is hardware-gated: mic_task never encodes while the play
+ *     ring is non-empty (audio_is_playing() ground truth);
+ *   - a listen round that draws no server response within
+ *     LISTEN_WATCHDOG_US is abandoned (kills false-wake ambient loops).
  *
  * State transitions:
  *   Idle -> Connecting -> Listening <-> Speaking -> Idle
@@ -148,8 +159,18 @@ static void button_check(button_t *b)
 #define LISTEN_ARM_DELAY_US (1200LL * 1000)   /* skip "Computer" tail */
 #define WAKE_REARM_DELAY_US  (1500LL * 1000)   /* wait for TTS echo to fade */
 #define CONV_TIMEOUT_US      (10LL * 1000000)  /* conversation mode: stay awake this long after TTS */
+#define LISTEN_ARM_FAST_US   (300LL * 1000)    /* button/conversation: no wake-word tail to skip */
 static int64_t s_listen_arm_at;
 static int64_t s_wake_rearm_at;
+static int64_t s_listen_since;   /* when the current LISTENING round started */
+
+/* If a wake-triggered listen round gets NO server response (no STT, no TTS)
+   within this window, drop back to standby.  Without this, a false wake-word
+   trigger (TV/room noise) leaves the mic hot forever and every stray sound
+   is transcribed and answered — which sounds like an endless echo loop.
+   Conversation-mode follow-up listens are bounded separately by
+   CONV_TIMEOUT_US; this covers the initial wake round only. */
+#define LISTEN_WATCHDOG_US (45LL * 1000000)
 
 static void enter_standby(void)
 {
@@ -157,6 +178,7 @@ static void enter_standby(void)
     audio_clear_playback();
     session_stop_listening();
     s_listen_arm_at = 0;
+    s_conv_deadline = 0;
     if (s_wake_ok && session_is_open()) {
         set_state(APP_STATE_IDLE);
         /* Delay arming the wake word so the mic doesn't trigger on the
@@ -167,10 +189,21 @@ static void enter_standby(void)
     }
 }
 
-static void start_listening_round(void)
+static void start_listening_round(int64_t arm_delay_us)
 {
     wake_word_set_armed(false);
-    s_listen_arm_at = esp_timer_get_time() + LISTEN_ARM_DELAY_US;
+    /* Always clear the session's listen flag before arming a NEW round, so
+       the deferred session_start_listening() actually transmits "listen
+       start".  Its early-return guard (`if (s_listening) return`) otherwise
+       silently swallows the start after a barge-in abort: the TTS_START path
+       never clears the flag (AUTO mode), and finish_tts_round — which clears
+       it — is skipped on the interrupt path.  Symptom: device shows
+       Listening and streams uplink audio for minutes, server never sends a
+       listen start acknowledgement or STT, device appears dead.  Clearing
+       the flag costs nothing in AUTO mode (local flag only, no MQTT send). */
+    session_stop_listening();
+    s_listen_arm_at = esp_timer_get_time() + arm_delay_us;
+    s_listen_since = esp_timer_get_time();
     set_state(APP_STATE_LISTENING);
 }
 
@@ -190,7 +223,7 @@ static void finish_tts_round(void)
     s_speak_quiet_at = 0;
     if (session_is_open()) {
         ESP_LOGI(TAG, "conversation mode — listening for follow-up");
-        start_listening_round();
+        start_listening_round(LISTEN_ARM_FAST_US);   /* no wake tail here; don't clip early speech */
         s_conv_deadline = esp_timer_get_time() + CONV_TIMEOUT_US;
     } else {
         set_state(APP_STATE_IDLE);
@@ -211,7 +244,8 @@ static void open_session(void)
     }
     if (s_pending_listen) {
         s_pending_listen = false;
-        start_listening_round();
+        /* session setup took seconds — any wake-word tail is long gone */
+        start_listening_round(LISTEN_ARM_FAST_US);
     } else if (s_wake_ok) {
         enter_standby();
     } else {
@@ -230,7 +264,7 @@ static void handle_event(app_msg_t *m)
         if (s_state == APP_STATE_IDLE) {
             if (session_is_open()) {
                 audio_clear_playback();
-                start_listening_round();
+                start_listening_round(LISTEN_ARM_DELAY_US);  /* skip "Computer" tail */
             } else {
                 /* session was closed by server goodbye — reconnect now */
                 s_pending_listen = true;
@@ -241,16 +275,25 @@ static void handle_event(app_msg_t *m)
     case APP_EVENT_BTN_DOWN:
         if (s_state == APP_STATE_IDLE && s_wake_ok) {
             if (session_is_open()) {
-                start_listening_round();
+                start_listening_round(LISTEN_ARM_FAST_US);  /* button press: no wake tail */
             } else {
                 s_pending_listen = true;
                 open_session();
             }
         } else if (s_state == APP_STATE_SPEAKING || s_tts_finishing) {
+            /* Barge-in mid-answer. Use the LONG arm delay, not the fast one:
+               playback was sounding right up until this press — the I2S DMA
+               tail and the room echo of the truncated answer need ~1 s to
+               fade before the mic opens, or the server hears the tail of our
+               own TTS, transcribes it as new speech, and we get an echo
+               loop.  (Conversation follow-ups can arm fast because playback
+               there has already been silent for 3 s before finish_tts_round
+               runs.) */
             s_tts_finishing = false;
             session_send_abort();
+            audio_stop_mic();
             audio_clear_playback();
-            start_listening_round();
+            start_listening_round(LISTEN_ARM_DELAY_US);  /* long delay: let TTS echo fade */
         }
         break;
     case APP_EVENT_STT:
@@ -266,6 +309,7 @@ static void handle_event(app_msg_t *m)
         /* Don't let our own TTS output echo into a phantom wake trigger
            while we're speaking/finishing; the standby path re-arms. */
         wake_word_set_armed(false);
+        s_listen_arm_at = 0;        /* cancel any pending mic-arm — we're speaking now */
         s_tts_finishing = false;    /* a new response supersedes any prior drain */
         s_tts_quiet_at = 0;
         s_conv_deadline = 0;        /* cancel conversation timeout — new answer */
@@ -475,8 +519,14 @@ void app_main(void)
         /* arm the listening round after the wake-word tail passes */
         if (s_listen_arm_at && esp_timer_get_time() >= s_listen_arm_at) {
             s_listen_arm_at = 0;
-            session_start_listening();
-            audio_start_mic();
+            /* Only start the mic if we're still LISTENING.  If a TTS_START
+               arrived during the 1.2 s arm delay the state is now SPEAKING
+               and arming the mic here would leave s_mic_running stale (and
+               skip the uplink warm-up) on the next conversation round. */
+            if (s_state == APP_STATE_LISTENING) {
+                session_start_listening();
+                audio_start_mic();
+            }
         }
         /* rearm wake word after TTS echo fade-out */
         if (s_wake_rearm_at && esp_timer_get_time() >= s_wake_rearm_at) {
@@ -519,6 +569,14 @@ void app_main(void)
         if (s_conv_deadline && now >= s_conv_deadline) {
             s_conv_deadline = 0;
             ESP_LOGI(TAG, "conversation timeout — going to sleep");
+            enter_standby();
+        }
+        /* listen watchdog: a wake-triggered round that gets no server
+           response at all (false wake on room noise) would otherwise stay
+           hot-mic indefinitely and keep answering ambient sounds. */
+        if (s_state == APP_STATE_LISTENING && !s_conv_deadline &&
+            s_listen_since && now - s_listen_since > LISTEN_WATCHDOG_US) {
+            ESP_LOGW(TAG, "listen timeout — no server response, back to standby");
             enter_standby();
         }
     }

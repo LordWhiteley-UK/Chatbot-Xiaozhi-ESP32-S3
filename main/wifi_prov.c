@@ -136,7 +136,11 @@ static esp_err_t scan_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
 
     static wifi_ap_record_t records[20];
-    uint16_t n = 0;
+    /* esp_wifi_scan_get_ap_records() uses `n` as an INPUT too (the record
+       capacity of `records`).  Passing 0 would tell the driver the buffer
+       holds zero records and always return an empty list — so the setup page
+       never showed any networks.  Seed it with the buffer capacity. */
+    uint16_t n = 20;
     wifi_scan_config_t scan_cfg = {
         .show_hidden = true,
         .scan_time.active = { .min = 100, .max = 300 },

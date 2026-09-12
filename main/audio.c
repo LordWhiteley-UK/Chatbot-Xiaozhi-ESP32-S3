@@ -68,6 +68,7 @@ static QueueHandle_t s_opus_queue;
 static TaskHandle_t s_mic_task, s_play_task, s_decode_task;
 static volatile bool s_mic_running;
 static volatile bool s_play_accept;   /* gate: accept incoming TTS packets? */
+static volatile bool s_play_muted;    /* hard gate: play_task writes nothing */
 static volatile int  s_play_level;    /* smoothed playback amplitude for face */
 static volatile int  s_volume = 40;   /* playback volume 0-100% (software scaling) */
 static volatile int s_play_sample_rate = 16000;
@@ -120,10 +121,16 @@ void audio_set_volume(int percent)
 
 void audio_clear_playback(void)
 {
+    s_play_muted = true;
     s_play_accept = false;
+    vTaskDelay(pdMS_TO_TICKS(50));   /* let play_task finish its current i2s_channel_write */
     if (s_opus_queue) xQueueReset(s_opus_queue);
     play_ring_drain();
     s_play_pending = 0;
+    /* play_task is muted — it will not write any more stale audio.
+       When unmuted it immediately starts feeding zeros, which overwrites
+       the DMA descriptors and kills the repeating-syllable loop. */
+    s_play_muted = false;
 }
 
 void audio_stop_accept(void)
@@ -135,11 +142,14 @@ void audio_stop_accept(void)
 
 void audio_play_flush(void)
 {
-    s_play_accept = true;   /* TTS_START: accept incoming audio */
+    s_play_muted = true;
+    vTaskDelay(pdMS_TO_TICKS(50));
     if (s_opus_queue) xQueueReset(s_opus_queue);
-    play_ring_drain();      /* drain any leftover audio before new TTS arrives */
+    play_ring_drain();
     s_play_pending = 0;
     opus_decoder_reset();
+    s_play_muted = false;
+    s_play_accept = true;
     ESP_LOGI(TAG, "playback flushed");
 }
 
@@ -147,12 +157,14 @@ void audio_set_playback_rate(int sample_rate)
 {
     if (sample_rate <= 0 || sample_rate == s_play_sample_rate) return;
     /* Reconfigure the I2S TX clock BEFORE any audio arrives — at hello time.
-       This avoids the race condition of disabling/enabling the channel while
-       the play_task is in the middle of an i2s_channel_write call. */
+       Mute play_task first so it isn't mid-write when we toggle the channel. */
+    s_play_muted = true;
+    vTaskDelay(pdMS_TO_TICKS(50));
     i2s_channel_disable(s_tx_chan);
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
     i2s_channel_reconfig_std_clock(s_tx_chan, &clk);
     i2s_channel_enable(s_tx_chan);
+    s_play_muted = false;
     s_play_sample_rate = sample_rate;
     ESP_LOGI(TAG, "playback sample rate -> %d Hz", sample_rate);
 }
@@ -222,6 +234,14 @@ static void mic_task(void *arg)
         if (s_on_pcm) s_on_pcm(s_pcm_in, frames);
 
         if (!s_mic_running) continue;
+        /* Hard acoustic-echo guard: never uplink mic audio while the speaker
+           is actually sounding (play ring non-empty).  The state machine
+           already keeps mic and speaker mutually exclusive, but this is a
+           belt-and-braces invariant — even if a state bug ever let the mic
+           run during playback, no speaker audio can leak into the uplink and
+           get transcribed as phantom speech.  During normal listening the
+           ring is empty so this never blocks legitimate user speech. */
+        if (audio_is_playing()) continue;
         if (esp_timer_get_time() - s_mic_opened_at < UPLINK_WARMUP_US) continue;
 
         size_t enc_len = 0;
@@ -237,11 +257,25 @@ static void play_task(void *arg)
     int16_t chunk[512];
     i2s_channel_enable(s_tx_chan);
     while (true) {
+        if (s_play_muted) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
         void *data = xRingbufferReceiveUpTo(s_play_ring, &br,
-                                            pdMS_TO_TICKS(200), sizeof(chunk));
+                                            pdMS_TO_TICKS(5), sizeof(chunk));
         if (!data) {
             /* idle: decay amplitude so the mouth closes between phrases */
             s_play_level = (s_play_level * 3) / 4;
+            /* CRITICAL: keep the TX DMA fed with silence while idle.  If we
+               simply stop writing, the I2S peripheral loops its LAST DMA
+               buffer forever — heard as a ~20 ms syllable of the previous
+               answer repeating endlessly (and that acoustic loop feeds back
+               into the mic and confuses the server's VAD).  This was most
+               obvious after a barge-in abort, which truncates playback
+               mid-word.  Writing zeros guarantees the tail drains and the
+               speaker goes truly quiet.  Zeros are rate-independent, so no
+               reconfiguration is needed. */
+            memset(chunk, 0, sizeof(chunk));
+            size_t zw = 0;
+            i2s_channel_write(s_tx_chan, chunk, sizeof(chunk), &zw,
+                              pdMS_TO_TICKS(100));
             continue;
         }
         memcpy(chunk, data, br);
