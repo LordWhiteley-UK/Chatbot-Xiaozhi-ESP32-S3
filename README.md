@@ -70,7 +70,7 @@ level is shown briefly on the OLED; in face mode it adjusts silently.
 Wire a momentary push button between the **D4 pad** (GPIO5) and **GND**.
 No external resistor needed — the internal pull-up is enabled in code.
 The unused broken-out pads with this wiring are D3 (GPIO4) and
-D10 (GPIO21) — everything else is taken (D0/D1/D2=mic, D5/D6=OLED,
+D10 (GPIO9) — everything else is taken (D0/D1/D2=mic, D5/D6=OLED,
 D7/D8/D9=amp). To use a different pad, change `BOARD_BUTTON_EXT` in
 `main/board.h`.
 
@@ -120,7 +120,7 @@ and opens wider for louder speech.
 
 | File | Purpose |
 |---|---|
-| `main/board.h` | fixed pin map (mic SD=1 WS=2 SCK=3, amp DIN=8 BCLK=9 LRC=10, OLED SDA=6 SCL=7, ext button=5) |
+| `main/board.h` | fixed pin map (mic SD=1 WS=2 SCK=3, amp DIN=44 BCLK=7 LRC=8, OLED SDA=6 SCL=43, ext button=5) |
 | `main/Kconfig.projbuild` | OTA URL, opus params, display orientation (this panel is mounted rotated 180°) |
 | `main/main.c` | app state machine: wake-word standby, listening rounds, conversation mode, TTS finishing, button multi-press, volume control |
 | `main/session_mqtt.c` | **MQTT+UDP transport** (docs/mqtt-udp.md): TLS MQTT control, AES-128-CTR Opus over UDP, unconnected socket for downlink |

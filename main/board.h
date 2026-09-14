@@ -1,6 +1,10 @@
 /**
  * board.h — fixed pin map for this assembled Seeed XIAO ESP32-S3 unit.
  * Wiring is already done; these are not configurable.
+ *
+ * NOTE: this XIAO variant's silkscreen is NOT the classic XIAO mapping:
+ *   D0-D5 = GPIO1-6, D6 = GPIO43 (UART0_TX), D7 = GPIO44 (UART0_RX),
+ *   D8 = GPIO7, D9 = GPIO8, D10 = GPIO9.
  */
 #pragma once
 
@@ -14,14 +18,16 @@
    broken out on the XIAO. */
 
 /* MAX98357A amplifier (I2S TX, controller I2S1) */
-#define BOARD_AMP_DIN   GPIO_NUM_8   /* D7 — data in of amp */
-#define BOARD_AMP_LRC   GPIO_NUM_10  /* D9 — word select    */
-#define BOARD_AMP_BCLK  GPIO_NUM_9   /* D8 — bit clock      */
-/* SD/GAIN floating -> always on, ~9 dB gain. No shutdown GPIO in this wiring. */
+#define BOARD_AMP_DIN   GPIO_NUM_44  /* D7 — data in of amp */
+#define BOARD_AMP_LRC   GPIO_NUM_8   /* D9 — word select    */
+#define BOARD_AMP_BCLK  GPIO_NUM_7   /* D8 — bit clock      */
+/* SD/GAIN floating -> always on, ~9 dB gain. No shutdown GPIO in this wiring.
+   D7/D9 are the UART0 RX/TX pads (GPIO44/43) — free because the console is
+   USB Serial/JTAG. */
 
 /* SSD1309 OLED 128x64 (I2C port 0) */
 #define BOARD_OLED_SDA  GPIO_NUM_6   /* D5 */
-#define BOARD_OLED_SCL  GPIO_NUM_7   /* D6 */
+#define BOARD_OLED_SCL  GPIO_NUM_43  /* D6 */
 #define BOARD_OLED_ADDR 0x3C
 
 /* On-board BOOT button (on the XIAO module itself, not part of external wiring) */

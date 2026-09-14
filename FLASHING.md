@@ -157,7 +157,7 @@ if something asks:
 | ESP-IDF version | **v5.3.3** |
 | Flash size | 8 MB |
 | PSRAM | Octal, 80 MHz (N8R8 module) |
-| Console | USB Serial/JTAG (GPIO43/44 = TX/RX pads, now unused) |
+| Console | USB Serial/JTAG (UART0 TX/RX pads D6/D7 repurposed as OLED SCL / amp DIN) |
 
 ---
 
@@ -206,7 +206,7 @@ when talking.
 
 Wire a momentary push button between the **D4 pad** (GPIO5) and **GND**.
 No external resistor needed — the internal pull-up is enabled in code.
-D3 (GPIO4) and D10 (GPIO21) are the unused broken-out pads on the XIAO
+D3 (GPIO4) and D10 (GPIO9) are the unused broken-out pads on the XIAO
 ESP32-S3 with this project's wiring. To use a different pad, change
 `BOARD_BUTTON_EXT` in `main/board.h`.
 
