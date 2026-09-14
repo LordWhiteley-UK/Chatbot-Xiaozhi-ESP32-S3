@@ -9,5 +9,10 @@ managed_components/
 
 # Full generated config (sdkconfig.defaults captures the project's choices)
 sdkconfig
-sdkconfig.oldmonitor.log
 sdkconfig.old
+
+# macOS
+.DS_Store
+
+# Serial monitor log
+monitor.log
