@@ -30,6 +30,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
@@ -228,8 +229,28 @@ static void mic_task(void *arg)
         if (i2s_channel_read(s_rx_chan, s_i2s_raw, sizeof(s_i2s_raw),
                              &bytes_read, pdMS_TO_TICKS(200)) != ESP_OK) continue;
         int frames = bytes_read / (2 * sizeof(int32_t));
-        for (int i = 0; i < frames; i++)
-            s_pcm_in[i] = (int16_t)(s_i2s_raw[2 * i] >> 16);
+        /* INMP441 channel auto-select: the L/R pin decides which 32-bit
+           slot carries the mic data. Pick the live channel per block so
+           the mic works whether L/R is grounded, tied high, or floating. */
+        {
+            int32_t lsum = 0, rsum = 0;
+            for (int i = 0; i < frames; i++) {
+                int32_t l = s_i2s_raw[2 * i] >> 16;
+                int32_t r = s_i2s_raw[2 * i + 1] >> 16;
+                lsum += l < 0 ? -l : l;
+                rsum += r < 0 ? -r : r;
+            }
+            int use_left = lsum >= rsum;
+            static int s_prev_chan = -1;
+            if (s_prev_chan != use_left) {
+                s_prev_chan = use_left;
+                ESP_LOGI(TAG, "mic channel auto-select: %s slot",
+                         use_left ? "left" : "right");
+            }
+            for (int i = 0; i < frames; i++)
+                s_pcm_in[i] = (int16_t)((use_left ? s_i2s_raw[2 * i]
+                                                  : s_i2s_raw[2 * i + 1]) >> 16);
+        }
 
         if (s_on_pcm) s_on_pcm(s_pcm_in, frames);
 
@@ -343,6 +364,10 @@ int audio_init(audio_frame_cb_t on_encoded_frame)
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_rx_chan, &rx_std));
     i2s_channel_enable(s_rx_chan);
+    /* INMP441 tri-states SD outside its selected channel slot — a weak
+       pull-down keeps the inactive slot reading 0 instead of floating,
+       which makes the channel auto-select in mic_task reliable. */
+    gpio_set_pull_mode(BOARD_MIC_SD, GPIO_PULLDOWN_ONLY);
 
     /* TX: MAX98357A — standard Philips, 16-bit mono */
     i2s_chan_config_t tx_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);

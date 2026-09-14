@@ -12,7 +12,9 @@
 #define BOARD_MIC_SD    GPIO_NUM_1   /* D0 — data out of mic  */
 #define BOARD_MIC_SCK   GPIO_NUM_3   /* D2 — bit clock        */
 #define BOARD_MIC_WS    GPIO_NUM_2   /* D1 — word select      */
-/* Mic L/R pin tied to GND -> left-channel slot.
+/* Mic L/R pin: best practice is to tie it to GND (left-channel slot), but
+   the firmware auto-detects whichever slot carries signal, so a floating
+   or high L/R also works.
    GPIO3 is a JTAG strapping pin — fine as a driven I2S clock: the
    strapping is only sampled at reset, and JTAG-on pins 39-42 are not
    broken out on the XIAO. */
