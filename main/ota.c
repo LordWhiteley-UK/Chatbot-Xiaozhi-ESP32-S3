@@ -100,7 +100,11 @@ int ota_fetch(ota_info_t *out)
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_header(client, "Device-Id", app_device_id());
     esp_http_client_set_header(client, "Client-Id", app_client_id());
-    esp_http_client_set_header(client, "Activation-Version", "1");
+    /* The console displays the device's firmware version from this header
+       (NOT from the application.version field in the body — empirically the
+       site showed "1.0" while the body said 2.0.0). Theme customisation is
+       gated on firmware > 2.0.0, so report 3. */
+    esp_http_client_set_header(client, "Activation-Version", "3");
     esp_http_client_set_post_field(client, body, strlen(body));
 
     /* response can be up to a few KB */
