@@ -10,6 +10,7 @@
  * name wherever they appear) and flagged to the user for confirmation.
  */
 #include "app.h"
+#include "board.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_system.h"
+#include "esp_netif.h"
 #include "cJSON.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -77,12 +79,30 @@ int ota_fetch(ota_info_t *out)
 {
     memset(out, 0, sizeof(*out));
 
-    char body[256];
+    /* Registration body per the documented schema: application + board.
+       The server keeps a per-device firmware record created on the FIRST
+       registration this client id makes.  A fresh record echoes the
+       reported version; an existing record never updates, so a device that
+       first registered as 1.0.0 keeps showing 1.0 forever (probed:
+       application.version 2.0.0/3.0.0 and re-binding did not move it).
+       The board object is required for the server to recognise the device;
+       omitting it leaves the record at its 1.0 default. */
+    char ip[16] = "0.0.0.0";
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta) {
+        esp_netif_ip_info_t ipi;
+        if (esp_netif_get_ip_info(sta, &ipi) == ESP_OK)
+            esp_ip4addr_ntoa(&ipi.ip, ip, sizeof(ip));
+    }
+    char body[512];
     snprintf(body, sizeof(body),
-             "{\"mac\":\"%s\",\"device_id\":\"%s\",\"application\":"
-             "{\"version\":\"%s\",\"compile_time\":\"%s %s\"}}",
+             "{\"mac\":\"%s\",\"device_id\":\"%s\","
+             "\"application\":{\"name\":\"xiaozhi\",\"version\":\"%s\","
+             "\"compile_time\":\"%s %s\"},"
+             "\"board\":{\"type\":\"%s\",\"name\":\"xiaozhi\","
+             "\"ip\":\"%s\",\"mac\":\"%s\"}}",
              app_device_id(), app_device_id(), app_firmware_version(),
-             __DATE__, __TIME__);
+             __DATE__, __TIME__, BOARD_OTA_TYPE, ip, app_device_id());
 
     esp_http_client_config_t cfg = {
         .url = CONFIG_OTA_URL,
@@ -100,11 +120,20 @@ int ota_fetch(ota_info_t *out)
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_header(client, "Device-Id", app_device_id());
     esp_http_client_set_header(client, "Client-Id", app_client_id());
-    /* The console displays the device's firmware version from this header
-       (NOT from the application.version field in the body — empirically the
-       site showed "1.0" while the body said 2.0.0). Theme customisation is
-       gated on firmware > 2.0.0, so report 3. */
-    esp_http_client_set_header(client, "Activation-Version", "3");
+    /* The server's per-device firmware record is created from this client
+       id's FIRST registration; the request version is stored in it then
+       (verified empirically against api.tenclass.net). */
+    ESP_LOGI(TAG, "ota client-id: %s", app_client_id());
+    /* User-Agent: "board_type/app_name-version" (documented schema) */
+    {
+        char ua[64];
+        snprintf(ua, sizeof(ua), "%s/xiaozhi-%s",
+                 BOARD_OTA_TYPE, app_firmware_version());
+        esp_http_client_set_header(client, "User-Agent", ua);
+    }
+    /* v1 activation (documented values are 1 or 2; 2 requires the HMAC
+       serial flow, which this device does not implement) */
+    esp_http_client_set_header(client, "Activation-Version", "1");
     esp_http_client_set_post_field(client, body, strlen(body));
 
     /* response can be up to a few KB */

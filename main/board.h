@@ -40,4 +40,10 @@
    Same behaviour as BOOT: short press = wake/barge-in, long press = face. */
 #define BOARD_BUTTON_EXT  GPIO_NUM_5   /* D4 */
 
+/* Board identity reported to the xiaozhi OTA endpoint (board.type in the
+   registration body).  The server keeps a per-device firmware record keyed
+   on this identity; a missing board object leaves the record at its 1.0
+   default and locks console features gated on firmware > 2.0.0. */
+#define BOARD_OTA_TYPE "esp32s3"
+
 /* USB D-/D+ are GPIO19/20 internally — never repurpose. */
