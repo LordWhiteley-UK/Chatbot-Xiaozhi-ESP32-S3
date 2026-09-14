@@ -2,7 +2,7 @@
  * display.c — SSD1309 128x64 I2C OLED status screens.
  *
  * The SSD1309 is command-compatible with the SSD1306, so the panel is driven
- * with the in-tree esp_lcd SSD1306 panel driver over the I2C bus (GPIO5/6).
+ * with the in-tree esp_lcd SSD1306 panel driver over the I2C bus (GPIO6/7).
  */
 #include "app.h"
 #include "board.h"

@@ -157,7 +157,7 @@ if something asks:
 | ESP-IDF version | **v5.3.3** |
 | Flash size | 8 MB |
 | PSRAM | Octal, 80 MHz (N8R8 module) |
-| Console | USB Serial/JTAG (not UART0 — GPIO43/44 are the mic) |
+| Console | USB Serial/JTAG (GPIO43/44 = TX/RX pads, now unused) |
 
 ---
 
@@ -204,11 +204,11 @@ when talking.
 
 ### Adding an external push button
 
-Wire a momentary push button between the **D2 pad** (GPIO3) and **GND**.
+Wire a momentary push button between the **D4 pad** (GPIO5) and **GND**.
 No external resistor needed — the internal pull-up is enabled in code.
-D2 is the only unused broken-out pad on the XIAO ESP32-S3 with this
-project's wiring. To use a different pad, change `BOARD_BUTTON_EXT` in
-`main/board.h`.
+D3 (GPIO4) and D10 (GPIO21) are the unused broken-out pads on the XIAO
+ESP32-S3 with this project's wiring. To use a different pad, change
+`BOARD_BUTTON_EXT` in `main/board.h`.
 
 ---
 

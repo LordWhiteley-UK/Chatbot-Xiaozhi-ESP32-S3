@@ -53,7 +53,7 @@ USB, tap **RESET**, release **BOOT** (ROM bootloader mode).
 ## Button controls
 
 Both the on-board **BOOT** button (GPIO0) and the optional **external
-push button** (GPIO3 / D2 pad) share the same multi-press logic:
+push button** (GPIO5 / D4 pad) share the same multi-press logic:
 
 | Gesture | Action |
 |---|---|
@@ -67,11 +67,12 @@ level is shown briefly on the OLED; in face mode it adjusts silently.
 
 ### Adding an external push button
 
-Wire a momentary push button between the **D2 pad** (GPIO3) and **GND**.
+Wire a momentary push button between the **D4 pad** (GPIO5) and **GND**.
 No external resistor needed — the internal pull-up is enabled in code.
-GPIO3 is the only unused broken-out pad on the XIAO ESP32-S3 with this
-wiring (D0=mic, D1=amp, D3=amp, D4/D5=OLED, D6=amp, D7=mic, D10=mic).
-To use a different pad, change `BOARD_BUTTON_EXT` in `main/board.h`.
+The unused broken-out pads with this wiring are D3 (GPIO4) and
+D10 (GPIO21) — everything else is taken (D0/D1/D2=mic, D5/D6=OLED,
+D7/D8/D9=amp). To use a different pad, change `BOARD_BUTTON_EXT` in
+`main/board.h`.
 
 ## Animated face display
 
@@ -119,7 +120,7 @@ and opens wider for louder speech.
 
 | File | Purpose |
 |---|---|
-| `main/board.h` | fixed pin map (mic SD=1 SCK=44 WS=9, amp DIN=2 LRC=4 BCLK=7, OLED SDA=5 SCL=6, ext button=3) |
+| `main/board.h` | fixed pin map (mic SD=1 WS=2 SCK=3, amp DIN=8 BCLK=9 LRC=10, OLED SDA=6 SCL=7, ext button=5) |
 | `main/Kconfig.projbuild` | OTA URL, opus params, display orientation (this panel is mounted rotated 180°) |
 | `main/main.c` | app state machine: wake-word standby, listening rounds, conversation mode, TTS finishing, button multi-press, volume control |
 | `main/session_mqtt.c` | **MQTT+UDP transport** (docs/mqtt-udp.md): TLS MQTT control, AES-128-CTR Opus over UDP, unconnected socket for downlink |

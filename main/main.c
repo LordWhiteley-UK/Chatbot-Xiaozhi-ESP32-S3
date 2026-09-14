@@ -110,7 +110,7 @@ static void on_encoded_frame(const uint8_t *opus, size_t len)
 
 /* ── buttons (debounced polling + long-press) ──────────────────── */
 /* Two buttons share the same logic: the on-board BOOT (GPIO0) and an
-   optional external momentary switch on D2/GPIO3.  Both fire the same
+   optional external momentary switch on D4/GPIO5.  Both fire the same
    events: short press = wake/barge-in, long press = toggle face. */
 typedef struct {
     int pin;

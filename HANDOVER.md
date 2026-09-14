@@ -36,15 +36,16 @@ probing the live backend instead.
 
 | Function | Part | Pins |
 |---|---|---|
-| Mic | INMP441 (I2S0 RX, 32-bit stereo, left slot) | SD=GPIO1, SCK=GPIO44, WS=GPIO9 |
-| Amp | MAX98357A (I2S1 TX) | DIN=GPIO2, LRC=GPIO4, BCLK=GPIO7 |
-| OLED | SSD1309 via esp_lcd SSD1306 driver (rotated 180°) | SDA=GPIO5, SCL=GPIO6 |
+| Mic | INMP441 (I2S0 RX, 32-bit stereo, left slot) | SD=GPIO1, WS=GPIO2, SCK=GPIO3 |
+| Amp | MAX98357A (I2S1 TX) | DIN=GPIO8, BCLK=GPIO9, LRC=GPIO10 |
+| OLED | SSD1309 via esp_lcd SSD1306 driver (rotated 180°) | SDA=GPIO6, SCL=GPIO7 |
 | USB | untouchable | GPIO19/20 |
-| Button | on-board BOOT (GPIO0) | optional trigger / barge-in |
+| Button | on-board BOOT (GPIO0), ext button (GPIO5, D4 pad) | wake / barge-in / volume / face |
 
 8MB flash, 8MB Octal PSRAM @80MHz. Console must be USB Serial/JTAG
-(GPIO43/44 are taken by the mic). Partition table `partitions.csv`:
-factory 2.5MB @0x10000, `model` 2MB @0x290000 (esp-sr wake-word model).
+(GPIO43/44 = TX/RX pads, unused with this wiring). Partition table
+`partitions.csv`: factory 2.5MB @0x10000, `model` 2MB @0x290000
+(esp-sr wake-word model).
 
 ## 3. Architecture / files
 
