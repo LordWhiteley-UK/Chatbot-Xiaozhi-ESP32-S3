@@ -137,6 +137,11 @@ int ota_fetch(ota_info_t *out)
                 find_field(root, "mqtt.password", out->mqtt_password, sizeof(out->mqtt_password));
                 find_field(root, "mqtt.publish_topic", out->mqtt_publish_topic, sizeof(out->mqtt_publish_topic));
                 find_field(root, "mqtt.subscribe_topic", out->mqtt_subscribe_topic, sizeof(out->mqtt_subscribe_topic));
+                /* what the server itself reports as this device's firmware
+                   version (the console display seems to lag our reported
+                   version — log it so we can see what it actually says) */
+                ESP_LOGI(TAG, "server firmware.version: %s",
+                         out->firmware_version[0] ? out->firmware_version : "(none)");
                 /* activation code: string field "code" under "activation" */
                 char code[16] = {0}, msg[64] = {0};
                 find_field(root, "activation.code", code, sizeof(code));
