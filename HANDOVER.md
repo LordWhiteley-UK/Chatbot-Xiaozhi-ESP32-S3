@@ -36,7 +36,7 @@ probing the live backend instead.
 
 | Function | Part | Pins |
 |---|---|---|
-| Mic | INMP441 (I2S0 RX, 32-bit stereo, left slot) | SD=GPIO1, WS=GPIO2, SCK=GPIO3 |
+| Mic | INMP441 (I2S0 RX, 32-bit stereo, channel auto-select) | SD=GPIO1, SCK=GPIO2, WS=GPIO3 |
 | Amp | MAX98357A (I2S1 TX) | DIN=GPIO44, BCLK=GPIO7, LRC=GPIO8 |
 | OLED | SSD1309 via esp_lcd SSD1306 driver (rotated 180°) | SDA=GPIO6, SCL=GPIO43 |
 | USB | untouchable | GPIO19/20 |

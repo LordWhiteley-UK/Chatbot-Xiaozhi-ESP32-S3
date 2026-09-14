@@ -10,8 +10,8 @@
 
 /* INMP441 microphone (I2S RX, controller I2S0) */
 #define BOARD_MIC_SD    GPIO_NUM_1   /* D0 — data out of mic  */
-#define BOARD_MIC_SCK   GPIO_NUM_3   /* D2 — bit clock        */
-#define BOARD_MIC_WS    GPIO_NUM_2   /* D1 — word select      */
+#define BOARD_MIC_SCK   GPIO_NUM_2   /* D1 — bit clock        */
+#define BOARD_MIC_WS    GPIO_NUM_3   /* D2 — word select      */
 /* Mic L/R pin: best practice is to tie it to GND (left-channel slot), but
    the firmware auto-detects whichever slot carries signal, so a floating
    or high L/R also works.
